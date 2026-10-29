@@ -14,6 +14,8 @@ jobs:
   publicar:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: write
     steps:
       - name: Descargar codigo
         uses: actions/checkout@v4
@@ -32,3 +34,12 @@ jobs:
           ACTUALIDAD_PANEL_USER: ${{ secrets.ACTUALIDAD_PANEL_USER }}
           ACTUALIDAD_PANEL_PASS: ${{ secrets.ACTUALIDAD_PANEL_PASS }}
         run: python automatizador.py
+
+      - name: Mantener vivo el horario (GitHub apaga los horarios si el repo pasa 60 dias sin cambios)
+        if: github.event_name == 'schedule'
+        run: |
+          date -u +%Y-%m-%d > ultima_corrida.txt
+          git config user.name "bot actualidad"
+          git config user.email "bot@actualidadnacional.net"
+          git add ultima_corrida.txt
+          git diff --staged --quiet || (git commit -m "chore: ultima corrida [skip ci]" && git push) || true
