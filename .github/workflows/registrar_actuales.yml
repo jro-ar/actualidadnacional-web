@@ -1,0 +1,60 @@
+name: Registrar notas actuales (no publica)
+
+# Se usa una sola vez: anota como "ya publicadas" las noticias que hoy estan arriba
+# en Infobae y TN, para que la proxima corrida no las repita.
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: actualidadnacional
+  cancel-in-progress: false
+
+jobs:
+  registrar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - name: Registrar sin publicar
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ACTUALIDAD_PANEL_USER: ${{ secrets.ACTUALIDAD_PANEL_USER }}
+          ACTUALIDAD_PANEL_PASS: ${{ secrets.ACTUALIDAD_PANEL_PASS }}
+        run: |
+          cat > /tmp/registrar.py <<'PY'
+          import sys
+          sys.path.insert(0, ".")
+          import automatizador as a
+          for u in a.obtener_noticias_infobae(6):
+              a.registrar_publicada(u)
+          for f in (a.obtener_nota_tn, a.obtener_nota_deportes_infobae):
+              try:
+                  n = f()
+                  if n:
+                      a.registrar_publicada(n.get("url"))
+              except Exception as e:
+                  print("aviso:", e)
+          print("Registradas:", len(a.URLS_PUBLICADAS))
+          PY
+          python /tmp/registrar.py
+
+      - name: Guardar registro de notas publicadas (y mantener vivo el horario)
+        if: always()
+        run: |
+          date -u +%Y-%m-%d > ultima_corrida.txt
+          git config user.name "bot actualidad"
+          git config user.email "bot@actualidadnacional.net"
+          for i in 1 2 3; do
+            git add publicadas.json ultima_corrida.txt
+            git diff --staged --quiet && break
+            git commit -m "chore: registro de notas publicadas [skip ci]"
+            if git push; then break; fi
+            git pull --rebase || true
+            sleep 3
+          done

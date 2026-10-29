@@ -2,8 +2,8 @@ name: Automatizador ActualidadNacional
 
 on:
   schedule:
-    # Cada 6 horas: 21:17, 3:17, 9:17 y 15:17 hora argentina
-    - cron: '17 0,6,12,18 * * *'
+    # Cada 3 horas: 3:17, 6:17, 9:17, 12:17, 15:17, 18:17, 21:17 y 0:17 hora argentina
+    - cron: '17 */3 * * *'
   workflow_dispatch:
 
 concurrency:
@@ -13,7 +13,7 @@ concurrency:
 jobs:
   publicar:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     permissions:
       contents: write
     steps:
@@ -35,11 +35,17 @@ jobs:
           ACTUALIDAD_PANEL_PASS: ${{ secrets.ACTUALIDAD_PANEL_PASS }}
         run: python automatizador.py
 
-      - name: Mantener vivo el horario (GitHub apaga los horarios si el repo pasa 60 dias sin cambios)
-        if: github.event_name == 'schedule'
+      - name: Guardar registro de notas publicadas (y mantener vivo el horario)
+        if: always()
         run: |
           date -u +%Y-%m-%d > ultima_corrida.txt
           git config user.name "bot actualidad"
           git config user.email "bot@actualidadnacional.net"
-          git add ultima_corrida.txt
-          git diff --staged --quiet || (git commit -m "chore: ultima corrida [skip ci]" && git push) || true
+          for i in 1 2 3; do
+            git add publicadas.json ultima_corrida.txt
+            git diff --staged --quiet && break
+            git commit -m "chore: registro de notas publicadas [skip ci]"
+            if git push; then break; fi
+            git pull --rebase || true
+            sleep 3
+          done
