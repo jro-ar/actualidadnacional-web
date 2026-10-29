@@ -1,0 +1,56 @@
+name: Prueba ortografia actualidadnacional (no publica)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests beautifulsoup4 lxml anthropic Pillow
+      - name: Probar reescritura y ortografia (sin publicar)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ACTUALIDAD_PANEL_USER: ${{ secrets.ACTUALIDAD_PANEL_USER }}
+          ACTUALIDAD_PANEL_PASS: ${{ secrets.ACTUALIDAD_PANEL_PASS }}
+        run: |
+          python -m py_compile automatizador.py && echo "SINTAXIS OK"
+          cat > /tmp/prueba.py <<'PY'
+          import sys
+          sys.path.insert(0, ".")
+          import automatizador as a
+
+          print("=== 1) Revision ortografica ===")
+          t, b, x = a.revisar_ortografia(
+              "El gobierno de Kicillof ratificó que si se sostienen las PASO",
+              "La medida se mantendra hasta nuevo aviso segun fuentes oficiales.",
+              "El ministro dijo que aun no hay definiciones. Mas tarde, el confirmo que la decision esta tomada.",
+              63, 170)
+          print("TITULO:", t)
+          assert "sí se sostienen" in t, "NO corrigio el si/sí"
+
+          print("=== 2) Reescritura completa (3 notas de ejemplo) ===")
+          cuerpo = ("El gobernador bonaerense Axel Kicillof confirmó este martes que la provincia de Buenos Aires mantendrá "
+                    "las elecciones primarias abiertas, simultáneas y obligatorias (PASO) el próximo año. "
+                    "\"Las PASO se sostienen\", afirmó el ministro de Gobierno, Carlos Bianco, en conferencia de prensa. "
+                    "La decisión se tomó tras una reunión con intendentes del peronismo, que habían pedido definiciones. "
+                    "La oposición criticó la medida y reclamó suspender las primarias por su costo. ") * 4
+          for i, (mt, mb) in enumerate([(63, 170), (45, 84), (45, 84)], 1):
+              nota = {"titulo_original": "Kicillof ratificó que se mantienen las PASO en la provincia de Buenos Aires",
+                      "bajada_original": "El gobierno bonaerense confirmó que habrá primarias el año próximo pese al reclamo opositor.",
+                      "cuerpo_original": cuerpo, "img_url": None, "url": "prueba"}
+              r = a.reescribir_con_ia(nota, max_titulo=mt, max_bajada=mb)
+              print(f"[{i}] TITULO ({len(r['titulo'])}/{mt}):", r["titulo"])
+              print(f"[{i}] BAJADA ({len(r['bajada'])}/{mb}):", r["bajada"])
+              print(f"[{i}] TEXTO: {len(r['texto'].split())} palabras")
+              assert r["titulo"] and len(r["titulo"]) <= mt
+              assert r["bajada"] and len(r["bajada"]) <= mb
+              assert len(r["texto"].split()) >= 100
+          print("PRUEBA OK")
+          PY
+          python /tmp/prueba.py
