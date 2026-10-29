@@ -23,6 +23,28 @@ HEADERS = {
 
 imagenes_usadas = set()
 
+# Registro de notas ya publicadas (para no repetir la misma noticia en corridas seguidas)
+ARCHIVO_PUBLICADAS = "publicadas.json"
+try:
+    with open(ARCHIVO_PUBLICADAS, encoding="utf-8") as _f:
+        URLS_PUBLICADAS = json.load(_f)
+except Exception:
+    URLS_PUBLICADAS = []
+
+
+def guardar_publicadas():
+    try:
+        with open(ARCHIVO_PUBLICADAS, "w", encoding="utf-8") as _f:
+            json.dump(URLS_PUBLICADAS[-500:], _f, ensure_ascii=False, indent=0)
+    except Exception as e:
+        print(f"  ⚠️ No se pudo guardar {ARCHIVO_PUBLICADAS}: {e}")
+
+
+def registrar_publicada(url):
+    if url and url not in URLS_PUBLICADAS:
+        URLS_PUBLICADAS.append(url)
+        guardar_publicadas()
+
 # Lista ampliada: incluye artículos, preposiciones, pronombres Y adjetivos
 # que nunca pueden terminar un título (siempre necesitan algo después)
 PALABRAS_MALAS = {
@@ -151,7 +173,7 @@ def obtener_noticias_infobae(cantidad=6):
         if not href.startswith("http"):
             href = "https://www.infobae.com" + href
         if "/politica/" not in href: continue
-        if href in vistos or len(href) < 40: continue
+        if href in vistos or href in URLS_PUBLICADAS or len(href) < 40: continue
         if any(x in href for x in ["#", "autor", "tag", "categoria"]): continue
         vistos.add(href)
         articulos.append(href)
@@ -195,7 +217,7 @@ def obtener_nota_tn():
         if not href.startswith("http"):
             href = "https://tn.com.ar" + href
         if "/economia/" not in href: continue
-        if href in vistos or len(href) < 40: continue
+        if href in vistos or href in URLS_PUBLICADAS or len(href) < 40: continue
         if any(x in href for x in ["#", "autor", "tag", "categoria"]): continue
         vistos.add(href)
         try:
@@ -235,7 +257,7 @@ def obtener_nota_deportes_infobae():
         if not href.startswith("http"):
             href = "https://www.infobae.com" + href
         if "/deportes/" not in href: continue
-        if href in vistos or len(href) < 40: continue
+        if href in vistos or href in URLS_PUBLICADAS or len(href) < 40: continue
         if any(x in href for x in ["#", "autor", "tag", "categoria"]): continue
         vistos.add(href)
         try:
@@ -540,6 +562,7 @@ def procesar_nota(nota, session, orden, max_titulo, max_bajada, idx):
     print("  ✅ Imagen OK" if ruta_img else "  ⚠️ Sin imagen.")
     if publicar_nota(session, nota, ruta_img, orden):
         print(f"  ✅ Publicada en orden {orden}!")
+        registrar_publicada(nota.get("url"))
         return True
     else:
         print("  ❌ Error al publicar.")
