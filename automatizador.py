@@ -601,10 +601,92 @@ def procesar_nota(nota, session, orden, max_titulo, max_bajada, idx):
     if publicar_nota(session, nota, ruta_img, orden):
         print(f"  ✅ Publicada en orden {orden}!")
         registrar_publicada(nota.get("url"))
+        seccion = "politica" if str(idx).startswith("pol") else "otra"
+        NOTAS_PUBLICADAS_AHORA.append((nota["titulo"], nota["bajada"], seccion))
         return True
     else:
         print("  ❌ Error al publicar.")
         return False
+
+
+# ── Aviso por WhatsApp con posts listos para X (gratis) ─────────────────────
+# Despues de publicar, le manda a Jorge por WhatsApp (CallMeBot) links que abren X
+# con el post ya escrito (titulo + link a la nota): solo tiene que tocar "Postear".
+# Necesita los secretos CALLMEBOT_APIKEY y CALLMEBOT_PHONE. Si faltan, no hace nada.
+# Nunca puede frenar ni romper la publicacion de notas.
+import html as _html
+import unicodedata as _ud
+from datetime import timedelta as _td
+
+CALLMEBOT_APIKEY = os.environ.get("CALLMEBOT_APIKEY", "").strip()
+CALLMEBOT_PHONE = os.environ.get("CALLMEBOT_PHONE", "").strip()
+HORAS_AVISO_X = {9, 12, 15, 18, 21}   # hora argentina de las tandas que mandan aviso
+MAX_POSTS_POR_AVISO = 2
+NOTAS_PUBLICADAS_AHORA = []           # (titulo, bajada, seccion) de esta corrida
+
+
+def _normalizar(t):
+    t = _ud.normalize("NFKD", _html.unescape(t or "")).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9]+", " ", t.lower()).strip()
+
+
+def _urls_por_titulo():
+    """Lee el sitemap del sitio y arma {titulo normalizado: url de la nota}."""
+    r = requests.get("https://actualidadnacional.net/sitemap.aspx", headers=HEADERS, timeout=20)
+    mapa = {}
+    for bloque_url in re.findall(r"<url>(.*?)</url>", r.text, re.S):
+        loc = re.search(r"<loc>(.*?)</loc>", bloque_url)
+        tit = re.search(r"<news:title>(.*?)</news:title>", bloque_url, re.S)
+        if loc and tit:
+            mapa.setdefault(_normalizar(tit.group(1)), loc.group(1).strip())
+    return mapa
+
+
+def _link_para_x(url):
+    # Link sin caracteres especiales para que WhatsApp no lo rompa; X arma la tarjeta
+    # con el titulo y la foto de la nota.
+    return "https://x.com/intent/post?url=" + url
+
+
+def avisar_posts_para_x():
+    try:
+        if not CALLMEBOT_APIKEY or not CALLMEBOT_PHONE:
+            print("ℹ️ Aviso para X: faltan los secretos de CallMeBot, no se manda.")
+            return
+        hora_ar = (datetime.utcnow() - _td(hours=3)).hour
+        if hora_ar not in HORAS_AVISO_X:
+            print(f"ℹ️ Aviso para X: no se manda a esta hora ({hora_ar} h).")
+            return
+        if not NOTAS_PUBLICADAS_AHORA:
+            print("ℹ️ Aviso para X: no hubo notas nuevas.")
+            return
+        time.sleep(20)  # le da tiempo al sitio a sumar las notas al sitemap
+        mapa = _urls_por_titulo()
+        # primero politica, despues el resto, en el orden en que se publicaron
+        orden = sorted(NOTAS_PUBLICADAS_AHORA, key=lambda n: 0 if n[2] == "politica" else 1)
+        elegidas = []
+        for titulo, bajada, seccion in orden:
+            url = mapa.get(_normalizar(titulo))
+            if url and re.fullmatch(r"https://actualidadnacional\.net/[A-Za-z0-9~_.\-]+", url):
+                elegidas.append((titulo, url))
+            if len(elegidas) >= MAX_POSTS_POR_AVISO:
+                break
+        if not elegidas:
+            print("⚠️ Aviso para X: no encontré los links de las notas nuevas en el sitemap.")
+            return
+        partes = ["Actualidad Nacional - posts para X. Toca cada link y despues Postear:"]
+        for i, (titulo, url) in enumerate(elegidas, 1):
+            partes.append(f"{i}) {titulo}: {_link_para_x(url)} ")
+        texto = " \n".join(partes).strip()
+        r = requests.get("https://api.callmebot.com/whatsapp.php",
+                         params={"phone": CALLMEBOT_PHONE, "text": texto, "apikey": CALLMEBOT_APIKEY},
+                         timeout=30)
+        if "queued" in r.text.lower():
+            print(f"✅ Aviso para X enviado por WhatsApp ({len(elegidas)} posts).")
+        else:
+            print(f"⚠️ Aviso para X: CallMeBot respondió {r.status_code}.")
+    except Exception as e:
+        print(f"⚠️ Aviso para X no enviado: {e}")
 
 
 def ejecutar_automatizacion():
@@ -639,6 +721,8 @@ def ejecutar_automatizacion():
     print(f"\n{'='*55}")
     print(f"🎉 TERMINADO: {publicadas} noticias publicadas")
     print("=" * 55)
+
+    avisar_posts_para_x()
 
 
 if __name__ == "__main__":
