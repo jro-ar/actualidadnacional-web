@@ -329,7 +329,13 @@ REGLAS ESTRICTAS:
   pronombres posesivos (su, mi, tu, nuestro), adjetivos sin sustantivo (propio, mismo, nuevo, gran, etc.).
   Ejemplo MALO: "La oposición busca unidad pero enfrenta su propio"  ← incompleto, falta sustantivo
   Ejemplo BUENO: "La oposición busca unidad pero no logra acuerdo"  ← completo
-- BAJADA: MÁXIMO {limite_bajada} caracteres. Frase completa con sentido.
+  PARA GOOGLE: nombrá al protagonista (nombre y apellido si es una persona conocida) y el tema concreto,
+  con las palabras que la gente escribiría en Google (ej.: dólar blue, jubilaciones, aumento, Milei, Kicillof).
+  El título se tiene que entender solo, con una lectura, sin jerga, metáforas ni fechas sueltas.
+  Ejemplo MALO: "Tipos de dólar en Argentina"  ← genérico, nadie lo busca así
+  Ejemplo BUENO: "Dólar blue: a cuánto cerró hoy"  ← concreto y buscable
+- BAJADA: MÁXIMO {limite_bajada} caracteres. Frase completa con sentido. Tiene que sumar el dato más importante
+  que no está en el título (una cifra, quién, dónde o desde cuándo).
 - TEXTO: mínimo 300 palabras, varios párrafos, conserva todos los datos.
 - No copies frases textuales. No menciones medios de comunicación.
 - ORTOGRAFIA: Usa 'u' en lugar de 'o' ante palabras que empiecen con 'o' u 'ho'. Usa 'e' en lugar de 'y' ante palabras que empiecen con 'i' u 'hi'.
