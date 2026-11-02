@@ -620,7 +620,7 @@ from datetime import timedelta as _td
 
 CALLMEBOT_APIKEY = os.environ.get("CALLMEBOT_APIKEY", "").strip()
 CALLMEBOT_PHONE = os.environ.get("CALLMEBOT_PHONE", "").strip()
-HORAS_AVISO_X = {9, 12, 15, 18, 21}   # hora argentina de las tandas que mandan aviso
+HORAS_AVISO_X = set(range(9, 23))   # de 9 a 22 h (hora argentina): las tandas de la noche no avisan
 MAX_POSTS_POR_AVISO = 2
 NOTAS_PUBLICADAS_AHORA = []           # (titulo, bajada, seccion) de esta corrida
 
