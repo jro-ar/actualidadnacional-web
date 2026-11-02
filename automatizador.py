@@ -523,7 +523,31 @@ def hacer_login():
     return session
 
 
-def publicar_nota(session, nota, ruta_imagen, orden):
+# Bloque "Seguinos en X" que va al final de cada nota (el sitio muestra el texto como HTML)
+LINK_SEGUIR_X = "https://x.com/intent/follow?screen_name=actualidad_nac"
+BLOQUE_SEGUIR_X = (
+    '<br><br><a href="' + LINK_SEGUIR_X + '" target="_blank" rel="noopener" '
+    'style="display:inline-block;background:#000;color:#fff;padding:8px 16px;'
+    'border-radius:20px;font-weight:bold;text-decoration:none;">'
+    'Seguí a Actualidad Nacional en X: @actualidad_nac</a>'
+)
+TEXTO_SEGUIR_X = "Seguí a Actualidad Nacional en X: @actualidad_nac"
+# Si el panel rechaza el HTML una vez, en el resto de la corrida se manda texto simple
+PANEL_ACEPTA_HTML = [True]
+
+
+def armar_cuerpo_html(texto):
+    """Separa la nota en párrafos (antes salía todo pegado) y agrega el botón de X al final."""
+    parrafos = [p.strip() for p in re.split(r"\n+", texto or "") if p.strip()]
+    return "<br><br>".join(parrafos) + BLOQUE_SEGUIR_X
+
+
+def armar_cuerpo_simple(texto):
+    """Versión de respaldo sin HTML: el texto tal cual, más la línea de X."""
+    return (texto or "").strip() + "\n\n" + TEXTO_SEGUIR_X
+
+
+def _enviar_nota(session, nota, ruta_imagen, orden, cuerpo):
     r = session.get(PANEL_FORM_URL, timeout=15)
     soup = BeautifulSoup(r.text, "lxml")
     vs = soup.find("input", {"id": "__VIEWSTATE"})["value"]
@@ -535,15 +559,29 @@ def publicar_nota(session, nota, ruta_imagen, orden):
         "radio": str(orden),
         "drpDay": hoy.strftime("%d"), "drpMonth": hoy.strftime("%m"), "drpYear": str(hoy.year),
         "txtTitle": nota["titulo"], "txtSubTitle": nota["bajada"],
-        "txtDescriptionLong": nota["texto"],
+        "txtDescriptionLong": cuerpo,
         "imgPublicar.x": "98", "imgPublicar.y": "22",
     }
     files = None
     if ruta_imagen and os.path.exists(ruta_imagen):
         files = {"flUpload": (os.path.basename(ruta_imagen), open(ruta_imagen, "rb"), "image/jpeg")}
-    r2 = session.post(PANEL_FORM_URL, data=data, files=files, timeout=30)
-    if files: files["flUpload"][1].close()
-    return r2.status_code == 200
+    try:
+        r2 = session.post(PANEL_FORM_URL, data=data, files=files, timeout=30)
+    finally:
+        if files: files["flUpload"][1].close()
+    rechazo = ("potentially dangerous" in r2.text.lower()
+               or "potencialmente peligroso" in r2.text.lower())
+    return r2.status_code == 200 and not rechazo
+
+
+def publicar_nota(session, nota, ruta_imagen, orden):
+    if PANEL_ACEPTA_HTML[0]:
+        if _enviar_nota(session, nota, ruta_imagen, orden, armar_cuerpo_html(nota["texto"])):
+            return True
+        # El panel no aceptó el HTML: se reintenta con texto simple y no se vuelve a probar HTML
+        print("  ⚠️ El panel rechazó el formato con párrafos/botón de X. Reintento con texto simple...")
+        PANEL_ACEPTA_HTML[0] = False
+    return _enviar_nota(session, nota, ruta_imagen, orden, armar_cuerpo_simple(nota["texto"]))
 
 
 def procesar_nota(nota, session, orden, max_titulo, max_bajada, idx):
