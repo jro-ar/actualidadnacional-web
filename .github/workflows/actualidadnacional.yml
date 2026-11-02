@@ -1,9 +1,8 @@
 name: Automatizador ActualidadNacional
 
 on:
-  schedule:
-    # Cada 3 horas: 3:17, 6:17, 9:17, 12:17, 15:17, 18:17, 21:17 y 0:17 hora argentina
-    - cron: '17 */3 * * *'
+  # Lo dispara cron-job.org cada 3 horas en punto (job "Actualizar actualidadnacional").
+  # Sin horario de GitHub para no publicar doble (GitHub atrasaba y salteaba corridas).
   workflow_dispatch:
 
 concurrency:
