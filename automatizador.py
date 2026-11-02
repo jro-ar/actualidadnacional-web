@@ -620,7 +620,9 @@ from datetime import timedelta as _td
 
 CALLMEBOT_APIKEY = os.environ.get("CALLMEBOT_APIKEY", "").strip()
 CALLMEBOT_PHONE = os.environ.get("CALLMEBOT_PHONE", "").strip()
-HORAS_AVISO_X = set(range(9, 23))   # de 9 a 22 h (hora argentina): las tandas de la noche no avisan
+# APAGADO (2/11/2026): X ya postea solo desde jro-ar/automatizador-noticias (postear_x_actualidad.py).
+# Para volver a prenderlo: HORAS_AVISO_X = set(range(9, 23))
+HORAS_AVISO_X = set()
 MAX_POSTS_POR_AVISO = 2
 NOTAS_PUBLICADAS_AHORA = []           # (titulo, bajada, seccion) de esta corrida
 
