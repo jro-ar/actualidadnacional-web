@@ -36,6 +36,11 @@ jobs:
           CALLMEBOT_PHONE: ${{ secrets.CALLMEBOT_PHONE }}
         run: python automatizador.py
 
+      - name: Avisar a Bing y otros buscadores (IndexNow)
+        if: always()
+        continue-on-error: true
+        run: python avisar_buscadores.py
+
       - name: Guardar registro de notas publicadas (y mantener vivo el horario)
         if: always()
         run: |
@@ -44,6 +49,7 @@ jobs:
           git config user.email "bot@actualidadnacional.net"
           for i in 1 2 3; do
             git add publicadas.json ultima_corrida.txt
+            [ -f indexnow_enviadas.json ] && git add indexnow_enviadas.json || true
             git diff --staged --quiet && break
             git commit -m "chore: registro de notas publicadas [skip ci]"
             if git push; then break; fi
