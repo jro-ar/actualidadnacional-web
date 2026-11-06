@@ -338,7 +338,7 @@ REGLAS ESTRICTAS:
   que no está en el título (una cifra, quién, dónde o desde cuándo).
 - TEXTO: mínimo 300 palabras, varios párrafos, conserva todos los datos.
 - No copies frases textuales. No menciones medios de comunicación.
-- ORTOGRAFIA: Usa 'u' en lugar de 'o' ante palabras que empiecen con 'o' u 'ho'. Usa 'e' en lugar de 'y' ante palabras que empiecen con 'i' u 'hi'.
+- ORTOGRAFIA: escribí 'y' y 'o' normalmente (el sistema ya corrige solo los casos de 'e' y 'u').
 - DATOS: usá SOLO datos que estén en el original. NO inventes ni completes fechas, días, meses, años, horarios,
   cifras, nombres, cargos ni lugares. Si el original dice "el lunes" o "este domingo", escribí eso mismo,
   sin agregar número de día ni mes. Hoy es {_hoy_texto()}.
