@@ -1,0 +1,67 @@
+name: Prueba verificacion de datos (no publica)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install requests beautifulsoup4 lxml anthropic Pillow
+      - name: Probar que no se publiquen datos inventados (sin publicar nada)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ACTUALIDAD_PANEL_USER: ${{ secrets.ACTUALIDAD_PANEL_USER }}
+          ACTUALIDAD_PANEL_PASS: ${{ secrets.ACTUALIDAD_PANEL_PASS }}
+        run: |
+          python -m py_compile automatizador.py && echo "SINTAXIS OK"
+          cat > /tmp/prueba_datos.py <<'PY'
+          import sys
+          sys.path.insert(0, ".")
+          import automatizador as a
+
+          cuerpo = ("El expresidente Mauricio Macri evalua no asistir a la misa que el papa Leon XIV celebrara el lunes en el "
+                    "Hipodromo de Palermo. Segun allegados, busca evitar un cruce con su primo, el jefe de Gobierno porteno "
+                    "Jorge Macri, con quien mantiene una relacion distante. El Gobierno nacional preve que asistan unas "
+                    "700.000 personas. El presidente Javier Milei recibira al Pontifice el domingo en la Casa Rosada. ") * 4
+          nota = {"titulo_original": "Macri evalua no ir a la misa del Papa para evitar a su primo",
+                  "bajada_original": "El expresidente no quiere cruzarse con Jorge Macri en Palermo.",
+                  "cuerpo_original": cuerpo, "img_url": None, "url": "prueba"}
+
+          print("=== 1) Control sin IA ===")
+          assert a.datos_inventados(cuerpo, "Macri no ira a la misa del 9 de junio"), "NO detecto el mes inventado"
+          assert not a.datos_inventados(cuerpo, "Macri no ira a la misa del lunes"), "falso positivo"
+          print("ok")
+
+          print("=== 2) Verificacion con IA de una nota con errores a proposito ===")
+          t, b, x = a.verificar_datos(
+              nota,
+              "Macri no ira a la misa del Papa el 9 de junio",
+              "El expresidente evitara la ceremonia en Palermo, donde se esperan 900.000 personas.",
+              ("Mauricio Macri no asistira a la misa del papa Leon XIV el 9 de junio en Palermo. "
+               "Busca evitar a su primo Jorge Macri, ministro de Economia. Se esperan 900.000 personas. ") * 3,
+              63, 170)
+          todo = (t + " " + b + " " + x).lower()
+          print("TITULO:", t)
+          print("BAJADA:", b)
+          assert "junio" not in todo, "quedo el mes inventado"
+          assert "900.000" not in todo, "quedo la cifra equivocada"
+          assert "ministro de econom" not in todo, "quedo el cargo equivocado"
+          print("ok")
+
+          print("=== 3) Reescritura completa con la verificacion incluida ===")
+          r = a.reescribir_con_ia(nota, max_titulo=63, max_bajada=170)
+          todo = (r["titulo"] + " " + r["bajada"] + " " + r["texto"]).lower()
+          print("TITULO:", r["titulo"])
+          print("BAJADA:", r["bajada"])
+          assert "junio" not in todo
+          assert not a.datos_inventados(cuerpo + nota["titulo_original"] + nota["bajada_original"], todo)
+          assert r["titulo"] and len(r["titulo"]) <= 63 and a.titulo_es_completo(r["titulo"])
+          print("PRUEBA OK")
+          PY
+          python /tmp/prueba_datos.py
