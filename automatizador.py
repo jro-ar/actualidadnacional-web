@@ -339,6 +339,9 @@ REGLAS ESTRICTAS:
 - TEXTO: mínimo 300 palabras, varios párrafos, conserva todos los datos.
 - No copies frases textuales. No menciones medios de comunicación.
 - ORTOGRAFIA: Usa 'u' en lugar de 'o' ante palabras que empiecen con 'o' u 'ho'. Usa 'e' en lugar de 'y' ante palabras que empiecen con 'i' u 'hi'.
+- DATOS: usá SOLO datos que estén en el original. NO inventes ni completes fechas, días, meses, años, horarios,
+  cifras, nombres, cargos ni lugares. Si el original dice "el lunes" o "este domingo", escribí eso mismo,
+  sin agregar número de día ni mes. Hoy es {_hoy_texto()}.
 
 Respondé EXACTAMENTE con este formato, sin nada antes ni después:
 <titulo>título</titulo>
@@ -396,12 +399,157 @@ Texto: {cuerpo_limpio[:4000]}"""
         bajada = acortar_con_ia(bajada, max_bajada, "bajada")
     bajada = cortar_texto(bajada, max_bajada)
 
+    # Verificación de datos contra el original (fechas, cifras, nombres). Si no se puede asegurar, no se publica.
+    titulo, bajada, datos["texto"] = verificar_datos(nota, titulo, bajada, datos["texto"], max_titulo, max_bajada)
+
     titulo = corregir_conjunciones(titulo)
     bajada = corregir_conjunciones(bajada)
     datos["texto"] = corregir_conjunciones(datos["texto"])
     titulo, bajada, datos["texto"] = revisar_ortografia(titulo, bajada, datos["texto"], max_titulo, max_bajada)
     print(f"  ✅ Título final ({len(titulo)} chars): {titulo}")
     return {**nota, "titulo": titulo, "bajada": bajada, "texto": datos["texto"]}
+
+
+MESES_ES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto",
+            "septiembre", "octubre", "noviembre", "diciembre"]
+DIAS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+
+
+def _ahora_ar():
+    from datetime import timedelta
+    return datetime.utcnow() - timedelta(hours=3)
+
+
+def _hoy_texto():
+    d = _ahora_ar()
+    return f"{DIAS_ES[d.weekday()]} {d.day} de {MESES_ES[d.month - 1]} de {d.year}"
+
+
+def _sin_tildes(t):
+    import unicodedata
+    t = unicodedata.normalize("NFKD", t or "").encode("ascii", "ignore").decode()
+    return t.lower()
+
+
+def datos_inventados(original, reescrita):
+    """Control final sin IA: meses y años que aparecen en la nota reescrita pero no en el original.
+    Devuelve la lista de problemas (vacía si está todo bien)."""
+    o = _sin_tildes(original)
+    r = _sin_tildes(reescrita)
+    hoy = _ahora_ar()
+    # El mes actual y los vecinos se aceptan (el original suele decir "este lunes", "el mes pasado")
+    vecinos = {MESES_ES[(hoy.month - 1 + k) % 12] for k in (-1, 0, 1)}
+    problemas = []
+    for mes in MESES_ES:
+        variantes = [mes] + (["setiembre"] if mes == "septiembre" else [])
+        en_r = any(re.search(rf"\b{v}\b", r) for v in variantes)
+        en_o = any(re.search(rf"\b{v}\b", o) for v in variantes)
+        if en_r and not en_o and mes not in vecinos:
+            problemas.append(f"el mes '{mes}' no figura en el original")
+    for anio in sorted(set(re.findall(r"\b(?:19|20)\d\d\b", r))):
+        if anio not in o and int(anio) not in (hoy.year, hoy.year + 1):
+            problemas.append(f"el año {anio} no figura en el original")
+    return problemas
+
+
+def verificar_datos(nota, titulo, bajada, texto, max_titulo, max_bajada):
+    """Compara la nota reescrita con el original y corrige cualquier dato distinto o inventado
+    (fechas, cifras, nombres, cargos, lugares). Si no se puede asegurar, lanza una excepción
+    y la nota NO se publica."""
+    cuerpo_limpio = limpiar_fuente(nota["cuerpo_original"])[:4000]
+    original_completo = f"{nota['titulo_original']}\n{nota['bajada_original']}\n{cuerpo_limpio}"
+    prompt = f"""Sos el editor de verificación de un diario argentino. Tu único trabajo es que la NOTA REESCRITA no tenga NINGÚN dato distinto del ORIGINAL ni datos inventados.
+
+Hoy es {_hoy_texto()}.
+
+Revisá uno por uno, en el título, la bajada y el texto:
+- Fechas, días de la semana, meses, años y horarios.
+- Cifras, montos, porcentajes, cantidades y resultados.
+- Nombres y apellidos, cargos, partidos, instituciones y lugares.
+- Quién dijo o hizo cada cosa (no atribuir dichos o hechos a otra persona).
+
+REGLAS:
+- Si un dato de la reescrita es distinto al del original, reemplazalo por el del original.
+- Si un dato de la reescrita NO figura en el original (inventado o deducido), sacalo o reemplazalo por lo que dice el original. Ejemplo: si el original dice "el lunes", no puede decir "9 de junio".
+- No cambies nada más: ni estilo, ni orden, ni palabras que estén bien.
+- El título debe tener como máximo {max_titulo} caracteres y la bajada como máximo {max_bajada}.
+- Si la nota reescrita tiene tantos errores que no se puede arreglar, poné IMPOSIBLE en el veredicto.
+
+Respondé EXACTAMENTE con este formato, sin nada antes ni después:
+<veredicto>OK, CORREGIDO o IMPOSIBLE</veredicto>
+<titulo>título</titulo>
+<bajada>bajada</bajada>
+<texto>texto</texto>
+<errores>un error corregido por línea, o "ninguno"</errores>
+
+ORIGINAL:
+Titulo: {nota['titulo_original']}
+Bajada: {nota['bajada_original']}
+Texto: {cuerpo_limpio}
+
+NOTA REESCRITA:
+TÍTULO: {titulo}
+BAJADA: {bajada}
+TEXTO:
+{texto}"""
+
+    def extraer(etiqueta, crudo):
+        m = re.search(rf"<{etiqueta}>(.*?)</{etiqueta}>", crudo, re.S)
+        return m.group(1).strip() if m else None
+
+    crudo = None
+    for intento in range(3):
+        try:
+            resp = cliente_anthropic.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=6000,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            crudo = resp.content[0].text
+            if extraer("veredicto", crudo) and extraer("titulo", crudo) and extraer("texto", crudo):
+                break
+            print(f"  ⚠️ Verificación de datos: respuesta sin formato (intento {intento + 1})")
+            crudo = None
+        except Exception as e:
+            print(f"  ⚠️ Verificación de datos falló (intento {intento + 1}): {e}")
+            crudo = None
+            time.sleep(3)
+    if not crudo:
+        raise Exception("no se pudo verificar los datos de la nota")
+
+    veredicto = _sin_tildes(extraer("veredicto", crudo)).upper()
+    if "IMPOSIBLE" in veredicto:
+        raise Exception("la verificación encontró demasiados datos erróneos")
+
+    if "CORREGIDO" in veredicto:
+        for c in (extraer("errores", crudo) or "").splitlines():
+            c = c.strip(" -•\t")
+            if c and c.lower() not in ("ninguno", "ninguna"):
+                print(f"  🔎 Dato corregido: {c}")
+        n_titulo = extraer("titulo", crudo) or titulo
+        n_bajada = extraer("bajada", crudo) or bajada
+        n_texto = extraer("texto", crudo) or texto
+        if len(n_texto.split()) < 0.6 * len(texto.split()):
+            raise Exception("la verificación devolvió un texto incompleto")
+        if n_titulo != titulo:
+            if len(n_titulo) > max_titulo:
+                n_titulo = acortar_con_ia(n_titulo, max_titulo, "título")
+            n_titulo = cortar_texto(n_titulo, max_titulo)
+            if not titulo_es_completo(n_titulo):
+                n_titulo = cortar_texto(acortar_con_ia(n_titulo, max_titulo, "título"), max_titulo)
+            if not titulo_es_completo(n_titulo):
+                raise Exception("el título corregido quedó incompleto")
+            print(f"  🔎 Título corregido: '{titulo}' → '{n_titulo}'")
+        if len(n_bajada) > max_bajada:
+            n_bajada = acortar_con_ia(n_bajada, max_bajada, "bajada")
+        n_bajada = cortar_texto(n_bajada, max_bajada)
+        titulo, bajada, texto = n_titulo, n_bajada, n_texto
+
+    problemas = datos_inventados(original_completo, f"{titulo}\n{bajada}\n{texto}")
+    if problemas:
+        raise Exception("datos que no están en el original: " + "; ".join(problemas))
+    print("  ✅ Datos verificados contra el original")
+    return titulo, bajada, texto
 
 
 def revisar_ortografia(titulo, bajada, texto, max_titulo, max_bajada):
