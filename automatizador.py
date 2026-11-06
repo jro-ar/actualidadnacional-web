@@ -247,6 +247,111 @@ def obtener_nota_tn():
     return None
 
 
+def obtener_notas_tn_politica(cantidad=6):
+    """Notas de TN Política que todavía no se publicaron (respaldo cuando Infobae no tiene novedades)."""
+    print("📰 Scrapeando TN Política (respaldo)...")
+    notas = []
+    try:
+        r = requests.get("https://tn.com.ar/politica/", headers=HEADERS, timeout=15)
+        soup = BeautifulSoup(r.text, "lxml")
+    except Exception as e:
+        print(f"  ⚠️ No se pudo abrir TN Política: {e}")
+        return notas
+    vistos = set()
+    for a in soup.find_all("a", href=True):
+        if len(notas) >= cantidad:
+            break
+        href = a["href"]
+        if not href.startswith("http"):
+            href = "https://tn.com.ar" + href
+        if "/politica/" not in href: continue
+        if href in vistos or href in URLS_PUBLICADAS or len(href) < 40: continue
+        if any(x in href for x in ["#", "autor", "tag", "categoria"]): continue
+        vistos.add(href)
+        try:
+            r2 = requests.get(href, headers=HEADERS, timeout=15)
+            soup2 = BeautifulSoup(r2.text, "lxml")
+            t = soup2.select_one("h1")
+            titulo = t.get_text(strip=True) if t else ""
+            if not titulo: continue
+            bajada = ""
+            for sel in ["h2", ".summary", ".lead"]:
+                b = soup2.select_one(sel)
+                if b: bajada = b.get_text(strip=True); break
+            parrafos = extraer_parrafos(soup2)
+            if not parrafos: continue
+            img_url = extraer_imagen_meta(soup2) or extraer_imagen_contenido(soup2)
+            notas.append({
+                "url": href,
+                "titulo_original": titulo,
+                "bajada_original": bajada,
+                "cuerpo_original": "\n\n".join(parrafos[:12]),
+                "img_url": img_url,
+            })
+        except Exception:
+            continue
+    print(f"  Encontré {len(notas)} notas en TN Política.")
+    return notas
+
+
+def titulos_recientes():
+    """Títulos de las últimas notas publicadas en el sitio (para no repetir el mismo hecho)."""
+    import html
+    try:
+        x = requests.get("https://actualidadnacional.net/rss.aspx", headers=HEADERS, timeout=20).text
+        return [html.unescape(t) for t in re.findall(r"<item><title>(.*?)</title>", x)][:40]
+    except Exception:
+        return []
+
+
+def ya_cubierta(nota, titulos):
+    """Pregunta a la IA si la noticia candidata es el mismo hecho que alguno de los títulos ya publicados."""
+    if not titulos:
+        return False
+    lista = "\n".join(f"- {t}" for t in titulos)
+    prompt = f"""Estos son los títulos que ya publicó un diario en las últimas horas:
+{lista}
+
+Noticia candidata:
+Título: {nota['titulo_original']}
+Bajada: {nota['bajada_original']}
+
+¿La noticia candidata cuenta el MISMO hecho que alguno de esos títulos (aunque esté escrita distinto)?
+Respondé solo SI o NO."""
+    try:
+        resp = cliente_anthropic.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=5,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.content[0].text.strip().upper().startswith("SI")
+    except Exception:
+        return True  # ante la duda, no repetir
+
+
+def completar_politica(session, publicadas_politica, objetivo=3):
+    """Si Infobae no trajo suficientes notas de política nuevas, completa con TN Política
+    (sin repetir hechos ya publicados). Devuelve cuántas publicó."""
+    faltan = objetivo - publicadas_politica
+    if faltan <= 0:
+        return 0
+    print(f"\n📌 POLÍTICA (respaldo): faltan {faltan} notas, busco en TN")
+    titulos = titulos_recientes() + [t for t, _, _ in NOTAS_PUBLICADAS_AHORA]
+    hechas = 0
+    for j, nota in enumerate(obtener_notas_tn_politica(6), 1):
+        if hechas >= faltan:
+            break
+        if ya_cubierta(nota, titulos):
+            print(f"  ↪ Ya publicada antes (mismo hecho): {nota['titulo_original'][:60]}")
+            registrar_publicada(nota["url"])
+            continue
+        if procesar_nota(nota, session, orden=1, max_titulo=63, max_bajada=170, idx=f"pol_tn_{j}"):
+            hechas += 1
+            titulos.append(nota.get("titulo", nota["titulo_original"]))
+        time.sleep(3)
+    return hechas
+
+
 def obtener_nota_deportes_infobae():
     print("📰 Scrapeando Infobae Deportes...")
     r = requests.get("https://www.infobae.com/deportes/", headers=HEADERS, timeout=15)
@@ -862,6 +967,12 @@ def ejecutar_automatizacion():
         if procesar_nota(nota, session, orden=1, max_titulo=63, max_bajada=170, idx=f"pol_{i}"):
             publicadas += 1
         time.sleep(3)
+
+    # Si Infobae no tuvo suficientes notas nuevas de política, completar con TN Política
+    try:
+        publicadas += completar_politica(session, publicadas)
+    except Exception as e:
+        print(f"  ⚠️ Respaldo de política falló: {e}")
 
     print("\n📌 SECCIÓN ECONOMÍA")
     nota_eco = obtener_nota_tn()
