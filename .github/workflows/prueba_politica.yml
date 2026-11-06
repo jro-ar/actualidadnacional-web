@@ -1,0 +1,39 @@
+name: Prueba respaldo politica TN (no publica)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - name: Probar TN Politica sin publicar
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ACTUALIDAD_PANEL_USER: ${{ secrets.ACTUALIDAD_PANEL_USER }}
+          ACTUALIDAD_PANEL_PASS: ${{ secrets.ACTUALIDAD_PANEL_PASS }}
+        run: |
+          python -m py_compile automatizador.py && echo "SINTAXIS OK"
+          cat > /tmp/p.py <<'PY'
+          import sys
+          sys.path.insert(0, ".")
+          import automatizador as a
+          notas = a.obtener_notas_tn_politica(4)
+          assert notas, "TN Politica no devolvio notas"
+          titulos = a.titulos_recientes()
+          print("Titulos recientes del sitio:", len(titulos))
+          assert titulos, "no se pudieron leer los titulos del sitio"
+          for n in notas:
+              print("-", n["titulo_original"][:80], "| ya cubierta:", a.ya_cubierta(n, titulos), "| parrafos:", len(n["cuerpo_original"]) )
+          r = a.reescribir_con_ia(notas[0], max_titulo=63, max_bajada=170)
+          print("TITULO:", r["titulo"])
+          print("BAJADA:", r["bajada"])
+          print("PRUEBA OK")
+          PY
+          python /tmp/p.py
