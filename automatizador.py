@@ -207,6 +207,41 @@ def extraer_nota_infobae(url):
         print(f"  ⚠️ Error: {e}"); return None
 
 
+# Notas de cotización del dólar: Google las marca como duplicadas si se repiten el mismo día
+# y con el mismo título (Search Console, 9/11/2026). Solo una por día y con la fecha en el título.
+COTIZACION_RE = re.compile(r"/economia/\d{4}/\d{2}/\d{2}/dolar-[^/]*(a-cuanto-cotiza|-hoy-)")
+_DIAS_CON_ACENTO = {"miercoles": "miércoles", "sabado": "sábado"}
+
+
+def es_cotizacion_dolar(url):
+    return bool(url and COTIZACION_RE.search(url))
+
+
+def ya_hay_cotizacion_del_dia(url):
+    """True si ya se publicó una nota de cotización del dólar con la misma fecha que esta."""
+    m = re.search(r"/economia/(\d{4}/\d{2}/\d{2})/", url or "")
+    if not m:
+        return False
+    marca = f"/economia/{m.group(1)}/"
+    return any(es_cotizacion_dolar(u) and marca in u for u in URLS_PUBLICADAS)
+
+
+def titulo_cotizacion_con_fecha(nota):
+    """Título único por día, con la fecha que trae la propia nota original. Si no la encuentra, no cambia nada."""
+    if not es_cotizacion_dolar(nota.get("url")):
+        return nota
+    m = re.search(r"(lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo)\s+(\d{1,2})\s+de\s+([a-záéíóú]+)",
+                  nota.get("titulo_original", ""), re.I)
+    if not m:
+        return nota
+    dia = m.group(1).lower()
+    dia = _DIAS_CON_ACENTO.get(dia, dia)
+    titulo = f"Dólar hoy, {dia} {m.group(2)} de {m.group(3).lower()}"
+    if len(titulo) <= 45:
+        nota["titulo"] = titulo
+    return nota
+
+
 def obtener_nota_tn():
     print("📰 Scrapeando TN Economía...")
     r = requests.get("https://tn.com.ar/economia/", headers=HEADERS, timeout=15)
@@ -219,6 +254,7 @@ def obtener_nota_tn():
         if "/economia/" not in href: continue
         if href in vistos or href in URLS_PUBLICADAS or len(href) < 40: continue
         if any(x in href for x in ["#", "autor", "tag", "categoria"]): continue
+        if es_cotizacion_dolar(href) and ya_hay_cotizacion_del_dia(href): continue
         vistos.add(href)
         try:
             r2 = requests.get(href, headers=HEADERS, timeout=15)
@@ -939,6 +975,7 @@ def procesar_nota(nota, session, orden, max_titulo, max_bajada, idx):
     print(f"  ✅ Extraída: {nota['titulo_original'][:60]}")
     try:
         nota = reescribir_con_ia(nota, max_titulo=max_titulo, max_bajada=max_bajada)
+        nota = titulo_cotizacion_con_fecha(nota)
         print(f"  ✅ Reescrita: {nota['titulo']}")
     except Exception as e:
         # Nunca publicar el original cortado ni copiado: si la IA falla, la nota se saltea
