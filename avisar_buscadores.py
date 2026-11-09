@@ -20,7 +20,7 @@ def main():
     try:
         xml = requests.get(f"https://{HOST}/sitemap.aspx", timeout=30,
                            headers={"User-Agent": "ActualidadNacionalBot/1.0"}).text
-        locs = re.findall(r"<loc>(https://actualidadnacional\.net/\d+~[^<]+)</loc>", xml)
+        locs = re.findall(r"<loc>(https://actualidadnacional\.net/(?:\d+~[^<]+|dolar-hoy\.aspx))</loc>", xml)
         locs = [l.replace("&amp;", "&") for l in locs]
         nuevas = [u for u in locs if u not in enviadas][:100]
         if not nuevas:
