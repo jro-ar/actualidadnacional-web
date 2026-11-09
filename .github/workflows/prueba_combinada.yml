@@ -1,0 +1,55 @@
+name: Prueba notas con dos fuentes (no publica)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - name: Armar notas de ejemplo con dos fuentes (sin publicar)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ACTUALIDAD_PANEL_USER: ${{ secrets.ACTUALIDAD_PANEL_USER }}
+          ACTUALIDAD_PANEL_PASS: ${{ secrets.ACTUALIDAD_PANEL_PASS }}
+        run: |
+          cat > /tmp/p.py <<'PY'
+          import sys, re, requests
+          from bs4 import BeautifulSoup
+          sys.path.insert(0, ".")
+          import automatizador as a
+          r = requests.get("https://www.infobae.com/politica/", headers=a.HEADERS, timeout=15)
+          soup = BeautifulSoup(r.text, "lxml")
+          urls = []
+          for x in soup.find_all("a", href=True):
+              h = x["href"]
+              if not h.startswith("http"): h = "https://www.infobae.com" + h
+              if "/politica/20" in h and h not in urls: urls.append(h)
+          hechas = 0
+          for u in urls[:8]:
+              if hechas >= 2: break
+              n = a.extraer_nota_infobae(u)
+              if not n or not n["titulo_original"]: continue
+              otra = a.buscar_segunda_fuente(n)
+              print("\n######## FUENTE 1:", n["titulo_original"])
+              if not otra:
+                  print("   (TN no tiene el mismo hecho, se sigue con una sola fuente)")
+                  continue
+              print("######## FUENTE 2:", otra["titulo_original"])
+              r2 = a.reescribir_con_ia(a.combinar_fuentes(n, otra), max_titulo=63, max_bajada=170)
+              print("\n=== NOTA RESULTANTE ===")
+              print("TITULO:", r2["titulo"])
+              print("BAJADA:", r2["bajada"])
+              print("TEXTO:")
+              print(r2["texto"])
+              print("=== FIN ===")
+              hechas += 1
+          print("PRUEBA OK", hechas)
+          PY
+          python /tmp/p.py
