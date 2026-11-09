@@ -352,6 +352,85 @@ def completar_politica(session, publicadas_politica, objetivo=3):
     return hechas
 
 
+def extraer_nota_tn(href):
+    """Lee una nota de TN y devuelve titulo, bajada, cuerpo e imagen (o None)."""
+    try:
+        r2 = requests.get(href, headers=HEADERS, timeout=15)
+        soup2 = BeautifulSoup(r2.text, "lxml")
+        t = soup2.select_one("h1")
+        titulo = t.get_text(strip=True) if t else ""
+        if not titulo:
+            return None
+        bajada = ""
+        for sel in ["h2", ".summary", ".lead"]:
+            b = soup2.select_one(sel)
+            if b: bajada = b.get_text(strip=True); break
+        parrafos = extraer_parrafos(soup2)
+        if not parrafos:
+            return None
+        return {"url": href, "titulo_original": titulo, "bajada_original": bajada,
+                "cuerpo_original": "\n\n".join(parrafos[:12]),
+                "img_url": extraer_imagen_meta(soup2) or extraer_imagen_contenido(soup2)}
+    except Exception:
+        return None
+
+
+def buscar_segunda_fuente(nota):
+    """Busca en TN Política una nota sobre el MISMO hecho. Devuelve esa nota o None."""
+    try:
+        r = requests.get("https://tn.com.ar/politica/", headers=HEADERS, timeout=15)
+        soup = BeautifulSoup(r.text, "lxml")
+    except Exception:
+        return None
+    candidatos, vistos = [], set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if not href.startswith("http"):
+            href = "https://tn.com.ar" + href
+        texto = a.get_text(" ", strip=True)
+        if "/politica/" not in href or href in vistos or len(href) < 40 or len(texto) < 25:
+            continue
+        vistos.add(href)
+        candidatos.append((texto[:150], href))
+        if len(candidatos) >= 30:
+            break
+    if not candidatos:
+        return None
+    lista = "\n".join(f"{i + 1}. {t}" for i, (t, _) in enumerate(candidatos))
+    prompt = f"""Noticia:
+Título: {nota['titulo_original']}
+Bajada: {nota['bajada_original']}
+
+¿Cuál de estos títulos de otro medio cuenta EXACTAMENTE el mismo hecho (no solo el mismo tema)?
+{lista}
+
+Respondé solo con el número, o NINGUNO si ninguno es el mismo hecho."""
+    try:
+        resp = cliente_anthropic.messages.create(model="claude-sonnet-4-6", max_tokens=10,
+                                                 messages=[{"role": "user", "content": prompt}])
+        m = re.search(r"\d+", resp.content[0].text)
+        if not m:
+            return None
+        i = int(m.group(0)) - 1
+        if not 0 <= i < len(candidatos):
+            return None
+        return extraer_nota_tn(candidatos[i][1])
+    except Exception:
+        return None
+
+
+def combinar_fuentes(nota, otra):
+    """Arma una nota con las dos fuentes juntas (la principal primero)."""
+    c1 = limpiar_fuente(nota["cuerpo_original"])[:3000]
+    c2 = limpiar_fuente(otra["cuerpo_original"])[:3000]
+    return {**nota,
+            "combinada": True,
+            "limite_original": 6500,
+            "cuerpo_original": f"FUENTE 1:\n{c1}\n\nFUENTE 2 (otro medio, mismo hecho):\nTítulo: {otra['titulo_original']}\n"
+                               f"Bajada: {otra['bajada_original']}\n{c2}",
+            "urls_extra": [otra["url"]]}
+
+
 def obtener_nota_deportes_infobae():
     print("📰 Scrapeando Infobae Deportes...")
     r = requests.get("https://www.infobae.com/deportes/", headers=HEADERS, timeout=15)
@@ -425,6 +504,16 @@ def reescribir_con_ia(nota, max_titulo=63, max_bajada=170):
     limite_titulo = max_titulo - 20  # política: 43, eco/dep: 25
     limite_bajada = max_bajada - 20  # política: 150, eco/dep: 64
 
+    limite_orig = nota.get("limite_original", 4000)
+    extra_combinada = ""
+    if nota.get("combinada"):
+        extra_combinada = """
+- DOS FUENTES: abajo hay DOS notas de distintos medios sobre el MISMO hecho. Escribí UNA sola nota más completa
+  que integre los datos de las dos (lo que una tiene y la otra no). Si las fuentes se contradicen en un dato,
+  no lo incluyas.
+- Cerrá el TEXTO con un párrafo que empiece con "Por qué importa:" explicando el contexto y qué puede cambiar,
+  usando SOLO información que esté en las fuentes (sin opiniones propias ni datos nuevos).
+"""
     prompt = f"""Sos un periodista argentino. Reescribi esta noticia con tus propias palabras.
 
 REGLAS ESTRICTAS:
@@ -447,7 +536,7 @@ REGLAS ESTRICTAS:
 - DATOS: usá SOLO datos que estén en el original. NO inventes ni completes fechas, días, meses, años, horarios,
   cifras, nombres, cargos ni lugares. Si el original dice "el lunes" o "este domingo", escribí eso mismo,
   sin agregar número de día ni mes. Hoy es {_hoy_texto()}.
-
+{extra_combinada}
 Respondé EXACTAMENTE con este formato, sin nada antes ni después:
 <titulo>título</titulo>
 <bajada>bajada</bajada>
@@ -456,7 +545,7 @@ Respondé EXACTAMENTE con este formato, sin nada antes ni después:
 ORIGINAL:
 Titulo: {nota['titulo_original']}
 Bajada: {nota['bajada_original']}
-Texto: {cuerpo_limpio[:4000]}"""
+Texto: {cuerpo_limpio[:limite_orig]}"""
 
     datos = None
     for intento in range(3):
@@ -561,7 +650,7 @@ def verificar_datos(nota, titulo, bajada, texto, max_titulo, max_bajada):
     """Compara la nota reescrita con el original y corrige cualquier dato distinto o inventado
     (fechas, cifras, nombres, cargos, lugares). Si no se puede asegurar, lanza una excepción
     y la nota NO se publica."""
-    cuerpo_limpio = limpiar_fuente(nota["cuerpo_original"])[:4000]
+    cuerpo_limpio = limpiar_fuente(nota["cuerpo_original"])[:nota.get("limite_original", 4000)]
     original_completo = f"{nota['titulo_original']}\n{nota['bajada_original']}\n{cuerpo_limpio}"
     prompt = f"""Sos el editor de verificación de un diario argentino. Tu único trabajo es que la NOTA REESCRITA no tenga NINGÚN dato distinto del ORIGINAL ni datos inventados.
 
