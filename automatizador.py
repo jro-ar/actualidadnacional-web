@@ -872,14 +872,14 @@ def hacer_login():
 
 
 # Bloque "Seguinos en X" que va al final de cada nota (el sitio muestra el texto como HTML)
-LINK_SEGUIR_X = "https://x.com/intent/follow?screen_name=actualidad_nac"
+LINK_SEGUIR_X = "https://x.com/intent/follow?screen_name=ActualidadNacAR"
 BLOQUE_SEGUIR_X = (
     '<br><br><a href="' + LINK_SEGUIR_X + '" target="_blank" rel="noopener" '
     'style="display:inline-block;background:#000;color:#fff;padding:8px 16px;'
     'border-radius:20px;font-weight:bold;text-decoration:none;">'
-    'Seguí a Actualidad Nacional en X: @actualidad_nac</a>'
+    'Seguí a Actualidad Nacional en X: @ActualidadNacAR</a>'
 )
-TEXTO_SEGUIR_X = "Seguí a Actualidad Nacional en X: @actualidad_nac"
+TEXTO_SEGUIR_X = "Seguí a Actualidad Nacional en X: @ActualidadNacAR"
 # Si el panel rechaza el HTML una vez, en el resto de la corrida se manda texto simple
 PANEL_ACEPTA_HTML = [True]
 
