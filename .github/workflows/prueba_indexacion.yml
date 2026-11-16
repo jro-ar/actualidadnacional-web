@@ -1,0 +1,50 @@
+name: Prueba indexacion (contexto y dolar, no publica)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - name: Armar notas de ejemplo con contexto (sin publicar nada)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ACTUALIDAD_PANEL_USER: ${{ secrets.ACTUALIDAD_PANEL_USER }}
+          ACTUALIDAD_PANEL_PASS: ${{ secrets.ACTUALIDAD_PANEL_PASS }}
+        run: |
+          python -m py_compile automatizador_prueba.py && echo "SINTAXIS OK"
+          cat > /tmp/p.py <<'PY'
+          import sys
+          sys.path.insert(0, ".")
+          import automatizador_prueba as a
+          a.URLS_PUBLICADAS = []
+          print("=== 1) Filtro de notas del dolar ===")
+          for t, esperado in [("Dólar blue hoy: a cuánto cerró este lunes", True), ("Cotización del dólar oficial", True),
+                              ("El Gobierno quiere eliminar el cepo al dólar", False), ("Milei presiona por suspensión de las PASO", False)]:
+              assert a.es_nota_cotizacion_dolar(t) == esperado, t
+          print("ok")
+          print("=== 2) Nota real reescrita con contexto ===")
+          hechas = 0
+          for url in a.obtener_noticias_infobae(6):
+              if hechas >= 2: break
+              n = a.extraer_nota_infobae(url)
+              if not n or not n["titulo_original"]: continue
+              try:
+                  r = a.reescribir_con_ia(n, max_titulo=63, max_bajada=170)
+              except Exception as e:
+                  print("  (descartada:", e, ")"); continue
+              print("\n######## TITULO:", r["titulo"])
+              print("BAJADA:", r["bajada"])
+              print("TEXTO:\n" + r["texto"])
+              print("######## FIN")
+              hechas += 1
+          print("PRUEBA OK", hechas)
+          PY
+          python /tmp/p.py
