@@ -232,6 +232,9 @@ def obtener_nota_tn():
             for sel in ["h2", ".summary", ".lead"]:
                 b = soup2.select_one(sel)
                 if b: bajada = b.get_text(strip=True); break
+            if es_nota_cotizacion_dolar(titulo, bajada):
+                print(f"  ⏭️ Nota del dólar salteada (va a /dolar-hoy.aspx): {titulo[:60]}")
+                continue
             parrafos = extraer_parrafos(soup2)
             if not parrafos: continue
             img_url = extraer_imagen_meta(soup2) or extraer_imagen_contenido(soup2)
@@ -600,8 +603,100 @@ Texto: {cuerpo_limpio[:limite_orig]}"""
     bajada = corregir_conjunciones(bajada)
     datos["texto"] = corregir_conjunciones(datos["texto"])
     titulo, bajada, datos["texto"] = revisar_ortografia(titulo, bajada, datos["texto"], max_titulo, max_bajada)
+    datos["texto"] = agregar_contexto(nota, titulo, bajada, datos["texto"])
     print(f"  ✅ Título final ({len(titulo)} chars): {titulo}")
     return {**nota, "titulo": titulo, "bajada": bajada, "texto": datos["texto"]}
+
+
+# ── Notas diarias del dólar: ya no se publican (ese tráfico va a /dolar-hoy.aspx) ──
+def es_nota_cotizacion_dolar(titulo, bajada=""):
+    """True si la nota es de cotización diaria del dólar (a cuánto cerró, dólar hoy, etc.)."""
+    t = _sin_tildes(f"{titulo} {bajada}")
+    if not re.search(r"\bdolar(es)?\b", t):
+        return False
+    return bool(re.search(r"\b(hoy|cotiza\w*|cotizacion\w*|cerro|abrio|a cuanto|precio|minuto a minuto|en vivo)\b", t))
+
+
+# ── Contexto propio: 2 o 3 oraciones de fondo que no están en la fuente ──
+# Muy controlado: sin números, fechas ni cargos que puedan estar desactualizados, sin muertes ni
+# hechos judiciales, y con una segunda revisión. Ante cualquier duda la nota sale SIN contexto.
+_CONTEXTO_PROHIBIDO = re.compile(
+    r"\b(muri\w*|muert\w*|fallec\w*|funeral\w*|velorio|asesin\w*|renunci\w*|detenid\w*|"
+    r"pres[oa]s?|condena\w*|imputad\w*|procesad\w*|actualmente|recientemente|ayer|hoy|manana|"
+    r"seg[uú]n|habr[ií]a|podr[ií]a)\b", re.I)
+
+
+def _contexto_seguro(ctx, nota_texto=""):
+    if not ctx or len(ctx) < 120 or len(ctx) > 480:
+        return False
+    # Números solo si son parte de un nombre que ya está en la nota (ej.: "las 62 Organizaciones")
+    if any(n not in (nota_texto or "") for n in re.findall(r"\d+", ctx)):
+        return False
+    if '"' in ctx or "“" in ctx or "«" in ctx:
+        return False
+    if _CONTEXTO_PROHIBIDO.search(_sin_tildes(ctx)):
+        return False
+    oraciones = [o for o in re.split(r"(?<=[.!?])\s+", ctx.strip()) if o]
+    return 2 <= len(oraciones) <= 3
+
+
+def agregar_contexto(nota, titulo, bajada, texto):
+    try:
+        prompt = f"""Sos editor de un diario argentino. Escribí un párrafo de CONTEXTO para la nota de abajo:
+2 o 3 oraciones (máximo 400 caracteres) que ayuden al lector a entender el tema y que NO estén en la nota.
+
+QUÉ PODÉS EXPLICAR (solo conocimiento general, estable y seguro):
+- Qué es o para qué sirve la institución, ley, impuesto, organismo, procedimiento o cargo que se menciona
+  (ej.: qué son las PASO, qué hace la Comisión de Asuntos Constitucionales, cómo se aprueba un presupuesto).
+- Por qué el tema importa en general para el país o para la gente.
+
+PROHIBIDO:
+- Números, cifras, porcentajes, fechas, años o días.
+- Decir qué cargo ocupa hoy una persona o qué pasó hace poco (puede estar desactualizado).
+- Hechos nuevos, rumores, citas, opiniones, predicciones o adjetivos de valoración.
+- Muertes, causas judiciales, detenciones o renuncias.
+- Repetir lo que ya dice la nota o contradecirla.
+Si no hay un contexto general que sea 100% seguro, respondé solo NADA.
+
+Hoy es {_hoy_texto()}. Respondé EXACTAMENTE así, sin nada más:
+<contexto>párrafo o NADA</contexto>
+
+NOTA:
+Título: {titulo}
+Bajada: {bajada}
+Texto: {texto[:3500]}"""
+        resp = cliente_anthropic.messages.create(model="claude-sonnet-4-6", max_tokens=500,
+                                                 messages=[{"role": "user", "content": prompt}])
+        m = re.search(r"<contexto>(.*?)</contexto>", resp.content[0].text, re.S)
+        ctx = re.sub(r"\s+", " ", m.group(1)).strip() if m else ""
+        ctx = re.sub(r"^contexto\s*:\s*", "", ctx, flags=re.I)
+        if not ctx or ctx.upper().startswith("NADA"):
+            print("  ℹ️ Contexto: no hay uno seguro, la nota sale sin contexto.")
+            return texto
+        if not _contexto_seguro(ctx, f"{titulo} {bajada} {texto}"):
+            print(f"  ℹ️ Contexto descartado por los controles: {ctx}")
+            return texto
+        revision = f"""Sos verificador de un diario argentino. Revisá este párrafo de contexto que se agregará a la nota.
+Respondé SI solo si TODAS sus afirmaciones son hechos generales y estables (de manual, de conocimiento público),
+verdaderos, y no contradicen la nota. Respondé NO si alguna es falsa, dudosa, una opinión o algo que pudo
+haber cambiado en los últimos años. Respondé solo SI o NO.
+
+PÁRRAFO: {ctx}
+
+NOTA:
+Título: {titulo}
+Texto: {texto[:3000]}"""
+        r2 = cliente_anthropic.messages.create(model="claude-sonnet-4-6", max_tokens=5,
+                                               messages=[{"role": "user", "content": revision}])
+        if not _sin_tildes(r2.content[0].text).strip().upper().startswith("SI"):
+            print(f"  ℹ️ Contexto descartado por la revisión: {ctx}")
+            return texto
+        ctx = corregir_conjunciones(ctx)
+        print(f"  ✅ Contexto agregado: {ctx}")
+        return texto.rstrip() + "\n\nContexto: " + ctx
+    except Exception as e:
+        print(f"  ℹ️ Contexto no agregado ({e}); la nota sale igual.")
+        return texto
 
 
 MESES_ES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto",
@@ -937,6 +1032,9 @@ def procesar_nota(nota, session, orden, max_titulo, max_bajada, idx):
         print("  ⚠️ Sin nota. Saltando...")
         return False
     print(f"  ✅ Extraída: {nota['titulo_original'][:60]}")
+    if es_nota_cotizacion_dolar(nota["titulo_original"], nota.get("bajada_original", "")):
+        print("  ⏭️ Nota de cotización del dólar: no se publica (ese tema está en /dolar-hoy.aspx).")
+        return False
     try:
         nota = reescribir_con_ia(nota, max_titulo=max_titulo, max_bajada=max_bajada)
         print(f"  ✅ Reescrita: {nota['titulo']}")
