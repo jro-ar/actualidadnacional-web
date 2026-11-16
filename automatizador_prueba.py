@@ -626,10 +626,13 @@ _CONTEXTO_PROHIBIDO = re.compile(
     r"seg[uú]n|habr[ií]a|podr[ií]a)\b", re.I)
 
 
-def _contexto_seguro(ctx):
+def _contexto_seguro(ctx, nota_texto=""):
     if not ctx or len(ctx) < 120 or len(ctx) > 480:
         return False
-    if re.search(r"\d", ctx) or '"' in ctx or "“" in ctx or "«" in ctx:
+    # Números solo si son parte de un nombre que ya está en la nota (ej.: "las 62 Organizaciones")
+    if any(n not in (nota_texto or "") for n in re.findall(r"\d+", ctx)):
+        return False
+    if '"' in ctx or "“" in ctx or "«" in ctx:
         return False
     if _CONTEXTO_PROHIBIDO.search(_sin_tildes(ctx)):
         return False
@@ -670,12 +673,13 @@ Texto: {texto[:3500]}"""
         if not ctx or ctx.upper().startswith("NADA"):
             print("  ℹ️ Contexto: no hay uno seguro, la nota sale sin contexto.")
             return texto
-        if not _contexto_seguro(ctx):
-            print(f"  ℹ️ Contexto descartado por los controles: {ctx[:90]}")
+        if not _contexto_seguro(ctx, f"{titulo} {bajada} {texto}"):
+            print(f"  ℹ️ Contexto descartado por los controles: {ctx}")
             return texto
-        revision = f"""Sos verificador de un diario. ¿Cada afirmación de este párrafo de contexto es un hecho general,
-cierto, que no puede estar desactualizado y que no contradice la nota? Ante la mínima duda, respondé NO.
-Respondé solo SI o NO.
+        revision = f"""Sos verificador de un diario argentino. Revisá este párrafo de contexto que se agregará a la nota.
+Respondé SI solo si TODAS sus afirmaciones son hechos generales y estables (de manual, de conocimiento público),
+verdaderos, y no contradicen la nota. Respondé NO si alguna es falsa, dudosa, una opinión o algo que pudo
+haber cambiado en los últimos años. Respondé solo SI o NO.
 
 PÁRRAFO: {ctx}
 
@@ -685,7 +689,7 @@ Texto: {texto[:3000]}"""
         r2 = cliente_anthropic.messages.create(model="claude-sonnet-4-6", max_tokens=5,
                                                messages=[{"role": "user", "content": revision}])
         if not _sin_tildes(r2.content[0].text).strip().upper().startswith("SI"):
-            print(f"  ℹ️ Contexto descartado por la revisión: {ctx[:90]}")
+            print(f"  ℹ️ Contexto descartado por la revisión: {ctx}")
             return texto
         ctx = corregir_conjunciones(ctx)
         print(f"  ✅ Contexto agregado: {ctx}")
