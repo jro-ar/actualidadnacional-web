@@ -1,0 +1,1179 @@
+import requests
+from bs4 import BeautifulSoup
+import anthropic
+import os, re, time, json, base64
+from datetime import datetime
+from io import BytesIO
+from PIL import Image
+
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+PANEL_URL = "https://www.actualidadnacional.net/panel/panel_listado.aspx"
+PANEL_FORM_URL = "https://www.actualidadnacional.net/panel/panel_agregar_nota.aspx"
+PANEL_USER        = os.environ.get("ACTUALIDAD_PANEL_USER", "")
+PANEL_PASS        = os.environ.get("ACTUALIDAD_PANEL_PASS", "")
+if not PANEL_USER or not PANEL_PASS:
+    raise SystemExit("Faltan los secretos ACTUALIDAD_PANEL_USER / ACTUALIDAD_PANEL_PASS en GitHub")
+
+cliente_anthropic = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "es-AR,es;q=0.9",
+}
+
+imagenes_usadas = set()
+
+# Registro de notas ya publicadas (para no repetir la misma noticia en corridas seguidas)
+ARCHIVO_PUBLICADAS = "publicadas.json"
+try:
+    with open(ARCHIVO_PUBLICADAS, encoding="utf-8") as _f:
+        URLS_PUBLICADAS = json.load(_f)
+except Exception:
+    URLS_PUBLICADAS = []
+
+
+def guardar_publicadas():
+    try:
+        with open(ARCHIVO_PUBLICADAS, "w", encoding="utf-8") as _f:
+            json.dump(URLS_PUBLICADAS[-500:], _f, ensure_ascii=False, indent=0)
+    except Exception as e:
+        print(f"  ⚠️ No se pudo guardar {ARCHIVO_PUBLICADAS}: {e}")
+
+
+def registrar_publicada(url):
+    if url and url not in URLS_PUBLICADAS:
+        URLS_PUBLICADAS.append(url)
+        guardar_publicadas()
+
+# Lista ampliada: incluye artículos, preposiciones, pronombres Y adjetivos
+# que nunca pueden terminar un título (siempre necesitan algo después)
+PALABRAS_MALAS = {
+    # artículos y determinantes
+    'de', 'del', 'la', 'el', 'los', 'las', 'un', 'una', 'unos', 'unas',
+    # preposiciones
+    'y', 'o', 'a', 'en', 'que', 'con', 'por', 'para', 'ante', 'bajo',
+    'cabe', 'hacia', 'hasta', 'sobre', 'tras', 'al', 'ni',
+    # pronombres posesivos/demostrativos (preceden a un sustantivo)
+    'su', 'sus', 'mi', 'mis', 'tu', 'tus', 'nuestro', 'nuestra',
+    'nuestros', 'nuestras', 'este', 'esta', 'estos', 'estas',
+    'ese', 'esa', 'esos', 'esas', 'aquel', 'aquella',
+    # pronombres/partículas
+    'se', 'no', 'si',
+    # adjetivos que SIEMPRE preceden o acompañan a un sustantivo
+    # (nunca cierran una idea solos)
+    'propio', 'propia', 'propios', 'propias',
+    'mismo', 'misma', 'mismos', 'mismas',
+    'nuevo', 'nueva', 'nuevos', 'nuevas',
+    'gran', 'grande', 'grandes',
+    'primer', 'primera', 'primeros', 'primeras',
+    'último', 'última', 'últimos', 'últimas',
+    'mayor', 'menor', 'peor', 'mejor',
+    'otro', 'otra', 'otros', 'otras',
+    'cada', 'todo', 'toda', 'todos', 'todas',
+    'cierto', 'cierta', 'ciertos', 'ciertas',
+    'algún', 'alguna', 'algunos', 'algunas',
+    'ningún', 'ninguna',
+}
+
+
+def cortar_texto(texto, max_chars):
+    """Corta el texto al límite de caracteres, eliminando
+    palabras incompletas al final (artículos, preposiciones, adjetivos)."""
+    if len(texto) <= max_chars:
+        return texto
+    cortado = texto[:max_chars].rsplit(' ', 1)[0]
+    # Eliminar palabras malas del final en loop hasta encontrar un cierre válido
+    for _ in range(20):  # máximo 20 iteraciones para no loop infinito
+        partes = cortado.rsplit(' ', 1)
+        if len(partes) > 1 and partes[-1].lower().rstrip('.,;:') in PALABRAS_MALAS:
+            cortado = partes[0]
+        else:
+            break
+    return cortado
+
+
+def titulo_es_completo(titulo):
+    """Verifica que el título no termine en una palabra que deja la frase abierta."""
+    if not titulo:
+        return False
+    ultima = titulo.rsplit(' ', 1)[-1].lower().rstrip('.,;:')
+    return ultima not in PALABRAS_MALAS
+
+
+def acortar_con_ia(texto, max_chars, tipo="título"):
+    """Usa IA para acortar el texto. Pide explícitamente una frase completa."""
+    prompt = f"""El siguiente {tipo} tiene {len(texto)} caracteres y debe tener MENOS de {max_chars} caracteres.
+
+Reescribilo MÁS CORTO con MÁXIMO {max_chars} caracteres.
+OBLIGATORIO: debe ser una oración COMPLETA que termine en un SUSTANTIVO o VERBO.
+PROHIBIDO terminar con artículos (el, la, los), preposiciones (de, en, por, con),
+pronombres posesivos (su, mi, tu) ni adjetivos sin su sustantivo (propio, mismo, nuevo, etc.).
+
+Ejemplo MALO: "La izquierda busca capitalizar el descontento pero enfrenta su propio"  ← incompleto
+Ejemplo BUENO: "La izquierda no puede capitalizar el descontento"  ← completo
+
+Responde SOLO con el texto corregido, sin comillas ni explicaciones.
+
+{tipo.upper()}: {texto}"""
+    resp = cliente_anthropic.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=200,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    resultado = resp.content[0].text.strip()
+    # Corte de seguridad con la lista ampliada
+    return cortar_texto(resultado, max_chars)
+
+
+def extraer_imagen_meta(soup):
+    for prop in ["og:image", "twitter:image"]:
+        meta = soup.find("meta", property=prop) or soup.find("meta", {"name": prop})
+        if meta and meta.get("content"):
+            src = meta["content"]
+            if "logo" not in src.lower() and len(src) > 50:
+                return src
+    return None
+
+
+def extraer_imagen_contenido(soup):
+    for img in soup.find_all("img"):
+        src = img.get("src") or img.get("data-src") or img.get("data-lazy") or ""
+        if not src.startswith("http"): continue
+        if "logo" in src.lower(): continue
+        if not any(ext in src.lower() for ext in [".jpg", ".jpeg", ".png", ".webp"]): continue
+        if len(src) < 50: continue
+        return src
+    return None
+
+
+def extraer_parrafos(soup):
+    parrafos = []
+    for sel in [".article-body", ".body-article", "[data-type='text']", ".content-body", ".nota-body"]:
+        c = soup.select_one(sel)
+        if c:
+            for p in c.find_all("p"):
+                t = p.get_text(strip=True)
+                if t and len(t) > 40: parrafos.append(t)
+            break
+    if not parrafos:
+        for p in soup.find_all("p"):
+            t = p.get_text(strip=True)
+            if t and len(t) > 60: parrafos.append(t)
+    return parrafos
+
+
+def obtener_noticias_infobae(cantidad=6):
+    print("📰 Scrapeando Infobae Política...")
+    r = requests.get("https://www.infobae.com/politica/", headers=HEADERS, timeout=15)
+    soup = BeautifulSoup(r.text, "lxml")
+    articulos = []
+    vistos = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if not href.startswith("http"):
+            href = "https://www.infobae.com" + href
+        if "/politica/" not in href: continue
+        if href in vistos or href in URLS_PUBLICADAS or len(href) < 40: continue
+        if any(x in href for x in ["#", "autor", "tag", "categoria"]): continue
+        vistos.add(href)
+        articulos.append(href)
+        if len(articulos) >= cantidad: break
+    print(f"  Encontré {len(articulos)} URLs.")
+    return articulos
+
+
+def extraer_nota_infobae(url):
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=15)
+        soup = BeautifulSoup(r.text, "lxml")
+        titulo = ""
+        for sel in ["h1.article-headline", "h1"]:
+            t = soup.select_one(sel)
+            if t: titulo = t.get_text(strip=True); break
+        bajada = ""
+        for sel in [".article-subheadline", "h2", ".summary"]:
+            b = soup.select_one(sel)
+            if b: bajada = b.get_text(strip=True); break
+        parrafos = extraer_parrafos(soup)
+        img_url = extraer_imagen_meta(soup) or extraer_imagen_contenido(soup)
+        return {
+            "url": url,
+            "titulo_original": titulo,
+            "bajada_original": bajada,
+            "cuerpo_original": "\n\n".join(parrafos[:12]),
+            "img_url": img_url,
+        }
+    except Exception as e:
+        print(f"  ⚠️ Error: {e}"); return None
+
+
+def obtener_nota_tn():
+    print("📰 Scrapeando TN Economía...")
+    r = requests.get("https://tn.com.ar/economia/", headers=HEADERS, timeout=15)
+    soup = BeautifulSoup(r.text, "lxml")
+    vistos = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if not href.startswith("http"):
+            href = "https://tn.com.ar" + href
+        if "/economia/" not in href: continue
+        if href in vistos or href in URLS_PUBLICADAS or len(href) < 40: continue
+        if any(x in href for x in ["#", "autor", "tag", "categoria"]): continue
+        vistos.add(href)
+        try:
+            r2 = requests.get(href, headers=HEADERS, timeout=15)
+            soup2 = BeautifulSoup(r2.text, "lxml")
+            titulo = ""
+            for sel in ["h1"]:
+                t = soup2.select_one(sel)
+                if t: titulo = t.get_text(strip=True); break
+            if not titulo: continue
+            bajada = ""
+            for sel in ["h2", ".summary", ".lead"]:
+                b = soup2.select_one(sel)
+                if b: bajada = b.get_text(strip=True); break
+            if es_nota_cotizacion_dolar(titulo, bajada):
+                print(f"  ⏭️ Nota del dólar salteada (va a /dolar-hoy.aspx): {titulo[:60]}")
+                continue
+            parrafos = extraer_parrafos(soup2)
+            if not parrafos: continue
+            img_url = extraer_imagen_meta(soup2) or extraer_imagen_contenido(soup2)
+            print(f"  ✅ Encontré nota TN: {titulo[:60]}")
+            return {
+                "url": href,
+                "titulo_original": titulo,
+                "bajada_original": bajada,
+                "cuerpo_original": "\n\n".join(parrafos[:12]),
+                "img_url": img_url,
+            }
+        except: continue
+    return None
+
+
+def obtener_notas_tn_politica(cantidad=6):
+    """Notas de TN Política que todavía no se publicaron (respaldo cuando Infobae no tiene novedades)."""
+    print("📰 Scrapeando TN Política (respaldo)...")
+    notas = []
+    try:
+        r = requests.get("https://tn.com.ar/politica/", headers=HEADERS, timeout=15)
+        soup = BeautifulSoup(r.text, "lxml")
+    except Exception as e:
+        print(f"  ⚠️ No se pudo abrir TN Política: {e}")
+        return notas
+    vistos = set()
+    for a in soup.find_all("a", href=True):
+        if len(notas) >= cantidad:
+            break
+        href = a["href"]
+        if not href.startswith("http"):
+            href = "https://tn.com.ar" + href
+        if "/politica/" not in href: continue
+        if href in vistos or href in URLS_PUBLICADAS or len(href) < 40: continue
+        if any(x in href for x in ["#", "autor", "tag", "categoria"]): continue
+        vistos.add(href)
+        try:
+            r2 = requests.get(href, headers=HEADERS, timeout=15)
+            soup2 = BeautifulSoup(r2.text, "lxml")
+            t = soup2.select_one("h1")
+            titulo = t.get_text(strip=True) if t else ""
+            if not titulo: continue
+            bajada = ""
+            for sel in ["h2", ".summary", ".lead"]:
+                b = soup2.select_one(sel)
+                if b: bajada = b.get_text(strip=True); break
+            parrafos = extraer_parrafos(soup2)
+            if not parrafos: continue
+            img_url = extraer_imagen_meta(soup2) or extraer_imagen_contenido(soup2)
+            notas.append({
+                "url": href,
+                "titulo_original": titulo,
+                "bajada_original": bajada,
+                "cuerpo_original": "\n\n".join(parrafos[:12]),
+                "img_url": img_url,
+            })
+        except Exception:
+            continue
+    print(f"  Encontré {len(notas)} notas en TN Política.")
+    return notas
+
+
+def titulos_recientes():
+    """Títulos de las últimas notas publicadas en el sitio (para no repetir el mismo hecho)."""
+    import html
+    try:
+        x = requests.get("https://actualidadnacional.net/rss.aspx", headers=HEADERS, timeout=20).text
+        return [html.unescape(t) for t in re.findall(r"<item><title>(.*?)</title>", x)][:40]
+    except Exception:
+        return []
+
+
+def ya_cubierta(nota, titulos):
+    """Pregunta a la IA si la noticia candidata es el mismo hecho que alguno de los títulos ya publicados."""
+    if not titulos:
+        return False
+    lista = "\n".join(f"- {t}" for t in titulos)
+    prompt = f"""Estos son los títulos que ya publicó un diario en las últimas horas:
+{lista}
+
+Noticia candidata:
+Título: {nota['titulo_original']}
+Bajada: {nota['bajada_original']}
+
+¿La noticia candidata cuenta el MISMO hecho que alguno de esos títulos (aunque esté escrita distinto)?
+Respondé solo SI o NO."""
+    try:
+        resp = cliente_anthropic.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=5,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return resp.content[0].text.strip().upper().startswith("SI")
+    except Exception:
+        return True  # ante la duda, no repetir
+
+
+def completar_politica(session, publicadas_politica, objetivo=3):
+    """Si Infobae no trajo suficientes notas de política nuevas, completa con TN Política
+    (sin repetir hechos ya publicados). Devuelve cuántas publicó."""
+    faltan = objetivo - publicadas_politica
+    if faltan <= 0:
+        return 0
+    print(f"\n📌 POLÍTICA (respaldo): faltan {faltan} notas, busco en TN")
+    titulos = titulos_recientes() + [t for t, _, _ in NOTAS_PUBLICADAS_AHORA]
+    hechas = 0
+    for j, nota in enumerate(obtener_notas_tn_politica(6), 1):
+        if hechas >= faltan:
+            break
+        if ya_cubierta(nota, titulos):
+            print(f"  ↪ Ya publicada antes (mismo hecho): {nota['titulo_original'][:60]}")
+            registrar_publicada(nota["url"])
+            continue
+        if procesar_nota(nota, session, orden=1, max_titulo=63, max_bajada=170, idx=f"pol_tn_{j}"):
+            hechas += 1
+            titulos.append(nota.get("titulo", nota["titulo_original"]))
+        time.sleep(3)
+    return hechas
+
+
+def extraer_nota_tn(href):
+    """Lee una nota de TN y devuelve titulo, bajada, cuerpo e imagen (o None)."""
+    try:
+        r2 = requests.get(href, headers=HEADERS, timeout=15)
+        soup2 = BeautifulSoup(r2.text, "lxml")
+        t = soup2.select_one("h1")
+        titulo = t.get_text(strip=True) if t else ""
+        if not titulo:
+            return None
+        bajada = ""
+        for sel in ["h2", ".summary", ".lead"]:
+            b = soup2.select_one(sel)
+            if b: bajada = b.get_text(strip=True); break
+        parrafos = extraer_parrafos(soup2)
+        if not parrafos:
+            return None
+        return {"url": href, "titulo_original": titulo, "bajada_original": bajada,
+                "cuerpo_original": "\n\n".join(parrafos[:12]),
+                "img_url": extraer_imagen_meta(soup2) or extraer_imagen_contenido(soup2)}
+    except Exception:
+        return None
+
+
+def buscar_segunda_fuente(nota):
+    """Busca en TN Política una nota sobre el MISMO hecho. Devuelve esa nota o None."""
+    try:
+        r = requests.get("https://tn.com.ar/politica/", headers=HEADERS, timeout=15)
+        soup = BeautifulSoup(r.text, "lxml")
+    except Exception:
+        return None
+    candidatos, vistos = [], set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if not href.startswith("http"):
+            href = "https://tn.com.ar" + href
+        texto = a.get_text(" ", strip=True)
+        if "/politica/" not in href or href in vistos or len(href) < 40 or len(texto) < 25:
+            continue
+        vistos.add(href)
+        candidatos.append((texto[:150], href))
+        if len(candidatos) >= 30:
+            break
+    if not candidatos:
+        return None
+    lista = "\n".join(f"{i + 1}. {t}" for i, (t, _) in enumerate(candidatos))
+    prompt = f"""Noticia:
+Título: {nota['titulo_original']}
+Bajada: {nota['bajada_original']}
+
+¿Cuál de estos títulos de otro medio cuenta EXACTAMENTE el mismo hecho (no solo el mismo tema)?
+{lista}
+
+Respondé solo con el número, o NINGUNO si ninguno es el mismo hecho."""
+    try:
+        resp = cliente_anthropic.messages.create(model="claude-sonnet-4-6", max_tokens=10,
+                                                 messages=[{"role": "user", "content": prompt}])
+        m = re.search(r"\d+", resp.content[0].text)
+        if not m:
+            return None
+        i = int(m.group(0)) - 1
+        if not 0 <= i < len(candidatos):
+            return None
+        return extraer_nota_tn(candidatos[i][1])
+    except Exception:
+        return None
+
+
+def combinar_fuentes(nota, otra):
+    """Arma una nota con las dos fuentes juntas (la principal primero)."""
+    c1 = limpiar_fuente(nota["cuerpo_original"])[:3000]
+    c2 = limpiar_fuente(otra["cuerpo_original"])[:3000]
+    return {**nota,
+            "combinada": True,
+            "limite_original": 6500,
+            "cuerpo_original": f"FUENTE 1:\n{c1}\n\nFUENTE 2 (otro medio, mismo hecho):\nTítulo: {otra['titulo_original']}\n"
+                               f"Bajada: {otra['bajada_original']}\n{c2}",
+            "urls_extra": [otra["url"]]}
+
+
+def obtener_nota_deportes_infobae():
+    print("📰 Scrapeando Infobae Deportes...")
+    r = requests.get("https://www.infobae.com/deportes/", headers=HEADERS, timeout=15)
+    soup = BeautifulSoup(r.text, "lxml")
+    vistos = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
+        if not href.startswith("http"):
+            href = "https://www.infobae.com" + href
+        if "/deportes/" not in href: continue
+        if href in vistos or href in URLS_PUBLICADAS or len(href) < 40: continue
+        if any(x in href for x in ["#", "autor", "tag", "categoria"]): continue
+        vistos.add(href)
+        try:
+            r2 = requests.get(href, headers=HEADERS, timeout=15)
+            soup2 = BeautifulSoup(r2.text, "lxml")
+            titulo = ""
+            for sel in ["h1.article-headline", "h1"]:
+                t = soup2.select_one(sel)
+                if t: titulo = t.get_text(strip=True); break
+            if not titulo or len(titulo) < 10: continue
+            bajada = ""
+            for sel in [".article-subheadline", "h2", ".summary"]:
+                b = soup2.select_one(sel)
+                if b: bajada = b.get_text(strip=True); break
+            parrafos = extraer_parrafos(soup2)
+            if not parrafos: continue
+            img_url = extraer_imagen_meta(soup2) or extraer_imagen_contenido(soup2)
+            if not img_url: continue
+            print(f"  ✅ Encontré nota deportes: {titulo[:60]}")
+            return {
+                "url": href,
+                "titulo_original": titulo,
+                "bajada_original": bajada,
+                "cuerpo_original": "\n\n".join(parrafos[:12]),
+                "img_url": img_url,
+            }
+        except: continue
+    return None
+
+
+def limpiar_fuente(texto):
+    for medio in ["Infobae", "TN", "Todo Noticias", "Olé", "Ole", "Clarín", "Clarin"]:
+        texto = re.sub(rf'[Cc]omo (contó|dijo|informó|publicó|señaló) {medio}[,.]?', '', texto)
+        texto = re.sub(rf'[Ss]egún {medio}[,.]?', '', texto)
+        texto = re.sub(medio, '', texto)
+    return texto
+
+
+def corregir_conjunciones(texto: str) -> str:
+    """
+    Corrige conjunciones segun ortografia espanola:
+    - 'o' -> 'u' antes de palabras que empiezan con 'o' u 'ho'
+    - 'y' -> 'e' antes de palabras que empiezan con 'i' u 'hi'
+    """
+    texto = re.sub(r'\bo\b(?=\s+[oO])', 'u', texto)
+    texto = re.sub(r'\bO\b(?=\s+[oO])', 'U', texto)
+    texto = re.sub(r'\bo\b(?=\s+[hH][oO])', 'u', texto)
+    texto = re.sub(r'\bO\b(?=\s+[hH][oO])', 'U', texto)
+    texto = re.sub(r'\by\b(?=\s+[iI])', 'e', texto)
+    texto = re.sub(r'\bY\b(?=\s+[iI])', 'E', texto)
+    texto = re.sub(r'\by\b(?=\s+[hH][iI])', 'e', texto)
+    texto = re.sub(r'\bY\b(?=\s+[hH][iI])', 'E', texto)
+    return texto
+
+
+def reescribir_con_ia(nota, max_titulo=63, max_bajada=170):
+    cuerpo_limpio = limpiar_fuente(nota['cuerpo_original'])
+    # Buffer ampliado: pedimos un límite MÁS ESTRICTO a Claude
+    # para que el resultado tenga más margen y no llegue al tope
+    limite_titulo = max_titulo - 20  # política: 43, eco/dep: 25
+    limite_bajada = max_bajada - 20  # política: 150, eco/dep: 64
+
+    limite_orig = nota.get("limite_original", 4000)
+    extra_combinada = ""
+    if nota.get("combinada"):
+        extra_combinada = """
+- DOS FUENTES: abajo hay DOS notas de distintos medios sobre el MISMO hecho. Escribí UNA sola nota más completa
+  que integre los datos de las dos (lo que una tiene y la otra no). Si las fuentes se contradicen en un dato,
+  no lo incluyas.
+- Cerrá el TEXTO con un párrafo que empiece con "Por qué importa:" explicando el contexto y qué puede cambiar,
+  usando SOLO información que esté en las fuentes (sin opiniones propias ni datos nuevos).
+"""
+    prompt = f"""Sos un periodista argentino. Reescribi esta noticia con tus propias palabras.
+
+REGLAS ESTRICTAS:
+- TITULO: MÁXIMO {limite_titulo} caracteres. Frase periodística corta y COMPLETA.
+  OBLIGATORIO: debe terminar en un SUSTANTIVO o VERBO.
+  PROHIBIDO terminar con: artículos (el, la, los), preposiciones (de, en, por),
+  pronombres posesivos (su, mi, tu, nuestro), adjetivos sin sustantivo (propio, mismo, nuevo, gran, etc.).
+  Ejemplo MALO: "La oposición busca unidad pero enfrenta su propio"  ← incompleto, falta sustantivo
+  Ejemplo BUENO: "La oposición busca unidad pero no logra acuerdo"  ← completo
+  PARA GOOGLE: nombrá al protagonista (nombre y apellido si es una persona conocida) y el tema concreto,
+  con las palabras que la gente escribiría en Google (ej.: dólar blue, jubilaciones, aumento, Milei, Kicillof).
+  El título se tiene que entender solo, con una lectura, sin jerga, metáforas ni fechas sueltas.
+  Ejemplo MALO: "Tipos de dólar en Argentina"  ← genérico, nadie lo busca así
+  Ejemplo BUENO: "Dólar blue: a cuánto cerró hoy"  ← concreto y buscable
+- BAJADA: MÁXIMO {limite_bajada} caracteres. Frase completa con sentido. Tiene que sumar el dato más importante
+  que no está en el título (una cifra, quién, dónde o desde cuándo).
+- TEXTO: mínimo 300 palabras, varios párrafos, conserva todos los datos.
+- No copies frases textuales. No menciones medios de comunicación.
+- ORTOGRAFIA: escribí 'y' y 'o' normalmente (el sistema ya corrige solo los casos de 'e' y 'u').
+- DATOS: usá SOLO datos que estén en el original. NO inventes ni completes fechas, días, meses, años, horarios,
+  cifras, nombres, cargos ni lugares. Si el original dice "el lunes" o "este domingo", escribí eso mismo,
+  sin agregar número de día ni mes. Hoy es {_hoy_texto()}.
+{extra_combinada}
+Respondé EXACTAMENTE con este formato, sin nada antes ni después:
+<titulo>título</titulo>
+<bajada>bajada</bajada>
+<texto>texto de la nota</texto>
+
+ORIGINAL:
+Titulo: {nota['titulo_original']}
+Bajada: {nota['bajada_original']}
+Texto: {cuerpo_limpio[:limite_orig]}"""
+
+    datos = None
+    for intento in range(3):
+        try:
+            resp = cliente_anthropic.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=3000,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            crudo = resp.content[0].text
+            datos = {}
+            for campo in ("titulo", "bajada", "texto"):
+                m = re.search(rf"<{campo}>(.*?)</{campo}>", crudo, re.S)
+                datos[campo] = m.group(1).strip() if m else ""
+            if all(datos.values()):
+                break
+            print(f"  ⚠️ Respuesta de IA incompleta (intento {intento + 1}), reintentando...")
+            datos = None
+        except Exception as e:
+            print(f"  ⚠️ Error IA (intento {intento + 1}): {e}")
+            datos = None
+            time.sleep(3)
+    if not datos:
+        raise Exception("la IA no devolvió una reescritura válida tras 3 intentos")
+    titulo = datos["titulo"]
+    bajada = datos["bajada"]
+
+    # --- Validación y corrección del TÍTULO ---
+    # Paso 1: si supera el límite máximo, pedir a IA que lo acorte
+    if len(titulo) > max_titulo:
+        titulo = acortar_con_ia(titulo, max_titulo, "título")
+
+    # Paso 2: corte mecánico de seguridad con lista ampliada
+    titulo = cortar_texto(titulo, max_titulo)
+
+    # Paso 3 (NUEVO): verificación de completitud semántica
+    # Si aún termina en palabra mala, pedir a IA que lo reescriba completo
+    if not titulo_es_completo(titulo):
+        print(f"  ⚠️ Título incompleto detectado: '{titulo}' → corrigiendo con IA...")
+        titulo = acortar_con_ia(titulo, max_titulo, "título")
+        titulo = cortar_texto(titulo, max_titulo)
+
+    # --- Validación y corrección de la BAJADA ---
+    if len(bajada) > max_bajada:
+        bajada = acortar_con_ia(bajada, max_bajada, "bajada")
+    bajada = cortar_texto(bajada, max_bajada)
+
+    # Verificación de datos contra el original (fechas, cifras, nombres). Si no se puede asegurar, no se publica.
+    titulo, bajada, datos["texto"] = verificar_datos(nota, titulo, bajada, datos["texto"], max_titulo, max_bajada)
+
+    titulo = corregir_conjunciones(titulo)
+    bajada = corregir_conjunciones(bajada)
+    datos["texto"] = corregir_conjunciones(datos["texto"])
+    titulo, bajada, datos["texto"] = revisar_ortografia(titulo, bajada, datos["texto"], max_titulo, max_bajada)
+    datos["texto"] = agregar_contexto(nota, titulo, bajada, datos["texto"])
+    print(f"  ✅ Título final ({len(titulo)} chars): {titulo}")
+    return {**nota, "titulo": titulo, "bajada": bajada, "texto": datos["texto"]}
+
+
+# ── Notas diarias del dólar: ya no se publican (ese tráfico va a /dolar-hoy.aspx) ──
+def es_nota_cotizacion_dolar(titulo, bajada=""):
+    """True si la nota es de cotización diaria del dólar (a cuánto cerró, dólar hoy, etc.)."""
+    t = _sin_tildes(f"{titulo} {bajada}")
+    if not re.search(r"\bdolar(es)?\b", t):
+        return False
+    return bool(re.search(r"\b(hoy|cotiza\w*|cotizacion\w*|cerro|abrio|a cuanto|precio|minuto a minuto|en vivo)\b", t))
+
+
+# ── Contexto propio: 2 o 3 oraciones de fondo que no están en la fuente ──
+# Muy controlado: sin números, fechas ni cargos que puedan estar desactualizados, sin muertes ni
+# hechos judiciales, y con una segunda revisión. Ante cualquier duda la nota sale SIN contexto.
+_CONTEXTO_PROHIBIDO = re.compile(
+    r"\b(muri\w*|muert\w*|fallec\w*|funeral\w*|velorio|asesin\w*|renunci\w*|detenid\w*|"
+    r"pres[oa]s?|condena\w*|imputad\w*|procesad\w*|actualmente|recientemente|ayer|hoy|manana|"
+    r"seg[uú]n|habr[ií]a|podr[ií]a)\b", re.I)
+
+
+def _contexto_seguro(ctx):
+    if not ctx or len(ctx) < 120 or len(ctx) > 480:
+        return False
+    if re.search(r"\d", ctx) or '"' in ctx or "“" in ctx or "«" in ctx:
+        return False
+    if _CONTEXTO_PROHIBIDO.search(_sin_tildes(ctx)):
+        return False
+    oraciones = [o for o in re.split(r"(?<=[.!?])\s+", ctx.strip()) if o]
+    return 2 <= len(oraciones) <= 3
+
+
+def agregar_contexto(nota, titulo, bajada, texto):
+    try:
+        prompt = f"""Sos editor de un diario argentino. Escribí un párrafo de CONTEXTO para la nota de abajo:
+2 o 3 oraciones (máximo 400 caracteres) que ayuden al lector a entender el tema y que NO estén en la nota.
+
+QUÉ PODÉS EXPLICAR (solo conocimiento general, estable y seguro):
+- Qué es o para qué sirve la institución, ley, impuesto, organismo, procedimiento o cargo que se menciona
+  (ej.: qué son las PASO, qué hace la Comisión de Asuntos Constitucionales, cómo se aprueba un presupuesto).
+- Por qué el tema importa en general para el país o para la gente.
+
+PROHIBIDO:
+- Números, cifras, porcentajes, fechas, años o días.
+- Decir qué cargo ocupa hoy una persona o qué pasó hace poco (puede estar desactualizado).
+- Hechos nuevos, rumores, citas, opiniones, predicciones o adjetivos de valoración.
+- Muertes, causas judiciales, detenciones o renuncias.
+- Repetir lo que ya dice la nota o contradecirla.
+Si no hay un contexto general que sea 100% seguro, respondé solo NADA.
+
+Hoy es {_hoy_texto()}. Respondé EXACTAMENTE así, sin nada más:
+<contexto>párrafo o NADA</contexto>
+
+NOTA:
+Título: {titulo}
+Bajada: {bajada}
+Texto: {texto[:3500]}"""
+        resp = cliente_anthropic.messages.create(model="claude-sonnet-4-6", max_tokens=500,
+                                                 messages=[{"role": "user", "content": prompt}])
+        m = re.search(r"<contexto>(.*?)</contexto>", resp.content[0].text, re.S)
+        ctx = re.sub(r"\s+", " ", m.group(1)).strip() if m else ""
+        ctx = re.sub(r"^contexto\s*:\s*", "", ctx, flags=re.I)
+        if not ctx or ctx.upper().startswith("NADA"):
+            print("  ℹ️ Contexto: no hay uno seguro, la nota sale sin contexto.")
+            return texto
+        if not _contexto_seguro(ctx):
+            print(f"  ℹ️ Contexto descartado por los controles: {ctx[:90]}")
+            return texto
+        revision = f"""Sos verificador de un diario. ¿Cada afirmación de este párrafo de contexto es un hecho general,
+cierto, que no puede estar desactualizado y que no contradice la nota? Ante la mínima duda, respondé NO.
+Respondé solo SI o NO.
+
+PÁRRAFO: {ctx}
+
+NOTA:
+Título: {titulo}
+Texto: {texto[:3000]}"""
+        r2 = cliente_anthropic.messages.create(model="claude-sonnet-4-6", max_tokens=5,
+                                               messages=[{"role": "user", "content": revision}])
+        if not _sin_tildes(r2.content[0].text).strip().upper().startswith("SI"):
+            print(f"  ℹ️ Contexto descartado por la revisión: {ctx[:90]}")
+            return texto
+        ctx = corregir_conjunciones(ctx)
+        print(f"  ✅ Contexto agregado: {ctx}")
+        return texto.rstrip() + "\n\nContexto: " + ctx
+    except Exception as e:
+        print(f"  ℹ️ Contexto no agregado ({e}); la nota sale igual.")
+        return texto
+
+
+MESES_ES = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto",
+            "septiembre", "octubre", "noviembre", "diciembre"]
+DIAS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+
+
+def _ahora_ar():
+    from datetime import timedelta
+    return datetime.utcnow() - timedelta(hours=3)
+
+
+def _hoy_texto():
+    d = _ahora_ar()
+    return f"{DIAS_ES[d.weekday()]} {d.day} de {MESES_ES[d.month - 1]} de {d.year}"
+
+
+def _sin_tildes(t):
+    import unicodedata
+    t = unicodedata.normalize("NFKD", t or "").encode("ascii", "ignore").decode()
+    return t.lower()
+
+
+def datos_inventados(original, reescrita):
+    """Control final sin IA: meses y años que aparecen en la nota reescrita pero no en el original.
+    Devuelve la lista de problemas (vacía si está todo bien)."""
+    o = _sin_tildes(original)
+    r = _sin_tildes(reescrita)
+    hoy = _ahora_ar()
+    # El mes actual y los vecinos se aceptan (el original suele decir "este lunes", "el mes pasado")
+    vecinos = {MESES_ES[(hoy.month - 1 + k) % 12] for k in (-1, 0, 1)}
+    problemas = []
+    for mes in MESES_ES:
+        variantes = [mes] + (["setiembre"] if mes == "septiembre" else [])
+        en_r = any(re.search(rf"\b{v}\b", r) for v in variantes)
+        en_o = any(re.search(rf"\b{v}\b", o) for v in variantes)
+        if en_r and not en_o and mes not in vecinos:
+            problemas.append(f"el mes '{mes}' no figura en el original")
+    for anio in sorted(set(re.findall(r"\b(?:19|20)\d\d\b", r))):
+        if anio not in o and int(anio) not in (hoy.year, hoy.year + 1):
+            problemas.append(f"el año {anio} no figura en el original")
+    return problemas
+
+
+def verificar_datos(nota, titulo, bajada, texto, max_titulo, max_bajada):
+    """Compara la nota reescrita con el original y corrige cualquier dato distinto o inventado
+    (fechas, cifras, nombres, cargos, lugares). Si no se puede asegurar, lanza una excepción
+    y la nota NO se publica."""
+    cuerpo_limpio = limpiar_fuente(nota["cuerpo_original"])[:nota.get("limite_original", 4000)]
+    original_completo = f"{nota['titulo_original']}\n{nota['bajada_original']}\n{cuerpo_limpio}"
+    prompt = f"""Sos el editor de verificación de un diario argentino. Tu único trabajo es que la NOTA REESCRITA no tenga NINGÚN dato distinto del ORIGINAL ni datos inventados.
+
+Hoy es {_hoy_texto()}.
+
+Revisá uno por uno, en el título, la bajada y el texto:
+- Fechas, días de la semana, meses, años y horarios.
+- Cifras, montos, porcentajes, cantidades y resultados.
+- Nombres y apellidos, cargos, partidos, instituciones y lugares.
+- Quién dijo o hizo cada cosa (no atribuir dichos o hechos a otra persona).
+
+REGLAS:
+- Si un dato de la reescrita es distinto al del original, reemplazalo por el del original.
+- Si un dato de la reescrita NO figura en el original (inventado o deducido), sacalo o reemplazalo por lo que dice el original. Ejemplo: si el original dice "el lunes", no puede decir "9 de junio".
+- No cambies nada más: ni estilo, ni orden, ni palabras que estén bien.
+- El título debe tener como máximo {max_titulo} caracteres y la bajada como máximo {max_bajada}.
+- Si la nota reescrita tiene tantos errores que no se puede arreglar, poné IMPOSIBLE en el veredicto.
+
+Respondé EXACTAMENTE con este formato, sin nada antes ni después:
+<veredicto>OK, CORREGIDO o IMPOSIBLE</veredicto>
+<titulo>título</titulo>
+<bajada>bajada</bajada>
+<texto>texto</texto>
+<errores>un error corregido por línea, o "ninguno"</errores>
+
+ORIGINAL:
+Titulo: {nota['titulo_original']}
+Bajada: {nota['bajada_original']}
+Texto: {cuerpo_limpio}
+
+NOTA REESCRITA:
+TÍTULO: {titulo}
+BAJADA: {bajada}
+TEXTO:
+{texto}"""
+
+    def extraer(etiqueta, crudo):
+        m = re.search(rf"<{etiqueta}>(.*?)</{etiqueta}>", crudo, re.S)
+        return m.group(1).strip() if m else None
+
+    crudo = None
+    for intento in range(3):
+        try:
+            resp = cliente_anthropic.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=6000,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            crudo = resp.content[0].text
+            if extraer("veredicto", crudo) and extraer("titulo", crudo) and extraer("texto", crudo):
+                break
+            print(f"  ⚠️ Verificación de datos: respuesta sin formato (intento {intento + 1})")
+            crudo = None
+        except Exception as e:
+            print(f"  ⚠️ Verificación de datos falló (intento {intento + 1}): {e}")
+            crudo = None
+            time.sleep(3)
+    if not crudo:
+        raise Exception("no se pudo verificar los datos de la nota")
+
+    veredicto = _sin_tildes(extraer("veredicto", crudo)).upper()
+    if "IMPOSIBLE" in veredicto:
+        raise Exception("la verificación encontró demasiados datos erróneos")
+
+    if "CORREGIDO" in veredicto:
+        for c in (extraer("errores", crudo) or "").splitlines():
+            c = c.strip(" -•\t")
+            if c and c.lower() not in ("ninguno", "ninguna"):
+                print(f"  🔎 Dato corregido: {c}")
+        n_titulo = extraer("titulo", crudo) or titulo
+        n_bajada = extraer("bajada", crudo) or bajada
+        n_texto = extraer("texto", crudo) or texto
+        if len(n_texto.split()) < 0.6 * len(texto.split()):
+            raise Exception("la verificación devolvió un texto incompleto")
+        if n_titulo != titulo:
+            if len(n_titulo) > max_titulo:
+                n_titulo = acortar_con_ia(n_titulo, max_titulo, "título")
+            n_titulo = cortar_texto(n_titulo, max_titulo)
+            if not titulo_es_completo(n_titulo):
+                n_titulo = cortar_texto(acortar_con_ia(n_titulo, max_titulo, "título"), max_titulo)
+            if not titulo_es_completo(n_titulo):
+                raise Exception("el título corregido quedó incompleto")
+            print(f"  🔎 Título corregido: '{titulo}' → '{n_titulo}'")
+        if len(n_bajada) > max_bajada:
+            n_bajada = acortar_con_ia(n_bajada, max_bajada, "bajada")
+        n_bajada = cortar_texto(n_bajada, max_bajada)
+        titulo, bajada, texto = n_titulo, n_bajada, n_texto
+
+    problemas = datos_inventados(original_completo, f"{titulo}\n{bajada}\n{texto}")
+    if problemas:
+        raise Exception("datos que no están en el original: " + "; ".join(problemas))
+    print("  ✅ Datos verificados contra el original")
+    return titulo, bajada, texto
+
+
+def revisar_ortografia(titulo, bajada, texto, max_titulo, max_bajada):
+    """Revision ortografica final (normas RAE) antes de publicar. Solo corrige errores, no reescribe."""
+    import difflib
+    prompt = f"""Sos un corrector ortográfico profesional de un diario argentino. Revisá el TÍTULO, la BAJADA y el TEXTO de abajo y corregí TODOS los errores de ortografía según las normas de la RAE.
+
+Prestá especial atención a:
+- Tildes diacríticas: sí (afirmación) / si (condicional); más (cantidad) / mas (pero); él (pronombre) / el (artículo); tú / tu; mí / mi; sé / se; dé / de; té / te; aún (todavía) / aun (incluso).
+- Interrogativos y exclamativos con tilde, también en preguntas indirectas: qué, cómo, cuándo, dónde, quién, cuál, cuánto.
+- Tildes en palabras agudas, graves y esdrújulas (por ejemplo: ratificó, político, según, después).
+- Mayúsculas en nombres propios y sin mayúsculas innecesarias.
+- Puntuación, signos de apertura (¿ ¡), comillas y espacios dobles.
+- Concordancia de género y número, y errores de tipeo.
+
+REGLAS:
+- Corregí SOLO errores. No cambies palabras, estilo, orden ni sentido si están bien escritas.
+- No agregues ni quites información. No alargues el título ni la bajada.
+- Si no hay errores, devolvé el texto exactamente igual.
+
+Respondé EXACTAMENTE con este formato, sin nada antes ni después:
+<titulo>título corregido</titulo>
+<bajada>bajada corregida</bajada>
+<texto>texto corregido</texto>
+<correcciones>una corrección por línea, o "ninguna"</correcciones>
+
+TÍTULO: {titulo}
+BAJADA: {bajada}
+TEXTO:
+{texto}"""
+
+    def extraer(etiqueta, crudo):
+        m = re.search(rf"<{etiqueta}>(.*?)</{etiqueta}>", crudo, re.S)
+        return m.group(1).strip() if m else None
+
+    crudo = None
+    for intento in range(3):
+        try:
+            resp = cliente_anthropic.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=6000,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            crudo = resp.content[0].text
+            if extraer("titulo", crudo) is not None:
+                break
+            print(f"  ⚠️ Revisión ortográfica: respuesta sin formato (intento {intento + 1})")
+            crudo = None
+        except Exception as e:
+            print(f"  ⚠️ Revisión ortográfica falló (intento {intento + 1}): {e}")
+            time.sleep(3)
+    if not crudo:
+        return titulo, bajada, texto
+
+    def aceptar(original, corregido, limite=None, minimo=0.85):
+        if not isinstance(corregido, str) or not corregido.strip():
+            return original
+        corregido = corregido.strip()
+        if limite and len(corregido) > limite:
+            return original
+        if difflib.SequenceMatcher(None, original, corregido).ratio() < minimo:
+            return original
+        return corregido
+
+    nuevo_titulo = aceptar(titulo, extraer("titulo", crudo), max_titulo)
+    nueva_bajada = aceptar(bajada, extraer("bajada", crudo), max_bajada)
+    nuevo_texto = aceptar(texto, extraer("texto", crudo), None, 0.9)
+    correcciones = extraer("correcciones", crudo) or ""
+    for c in correcciones.splitlines():
+        c = c.strip(" -•\t")
+        if c and c.lower() != "ninguna":
+            print(f"  ✏️ Ortografía: {c}")
+    if nuevo_titulo != titulo:
+        print(f"  ✏️ Título corregido: '{titulo}' → '{nuevo_titulo}'")
+    print("  ✅ Revisión ortográfica OK")
+    return nuevo_titulo, nueva_bajada, nuevo_texto
+
+
+def descargar_imagen(img_url, nombre):
+    if not img_url: return None
+    if img_url in imagenes_usadas:
+        print(f"  ⚠️ Imagen ya usada, saltando...")
+        return None
+    try:
+        r = requests.get(img_url, headers=HEADERS, timeout=15)
+        img = Image.open(BytesIO(r.content)).convert("RGB")
+        # 1200 px de ancho: es el minimo que pide Google Discover para mostrar fotos grandes
+        if img.width > 1200:
+            ratio = 1200 / img.width
+            img = img.resize((1200, int(img.height * ratio)), Image.LANCZOS)
+        ruta = f"/tmp/{nombre}.jpg"
+        img.save(ruta, "JPEG", quality=85)
+        imagenes_usadas.add(img_url)
+        return ruta
+    except Exception as e:
+        print(f"  ⚠️ Sin imagen: {e}"); return None
+
+
+def hacer_login():
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    r = session.get("https://www.actualidadnacional.net/panel/login.aspx", timeout=15)
+    if r.status_code != 200:
+        r = session.get(PANEL_URL, timeout=15)
+    soup = BeautifulSoup(r.text, "lxml")
+    vs = soup.find("input", {"id": "__VIEWSTATE"})
+    vsg = soup.find("input", {"id": "__VIEWSTATEGENERATOR"})
+    ev = soup.find("input", {"id": "__EVENTVALIDATION"})
+    uf = soup.find("input", {"type": "text"})
+    pf = soup.find("input", {"type": "password"})
+    sb = soup.find("input", {"type": "submit"}) or soup.find("input", {"type": "image"})
+    payload = {
+        "__VIEWSTATE": vs["value"] if vs else "",
+        "__VIEWSTATEGENERATOR": vsg["value"] if vsg else "",
+        "__EVENTVALIDATION": ev["value"] if ev else "",
+        uf["name"] if uf else "txtUser": PANEL_USER,
+        pf["name"] if pf else "txtPass": PANEL_PASS,
+        sb["name"] if sb else "btnLogin": "Ingresar",
+    }
+    r2 = session.post(r.url, data=payload, timeout=15)
+    if "PANEL" in r2.text or "Agregar" in r2.text:
+        print("✅ Login exitoso")
+    else:
+        print("⚠️ Login no confirmado, continúo igual...")
+    return session
+
+
+# Bloque "Seguinos en X" que va al final de cada nota (el sitio muestra el texto como HTML)
+LINK_SEGUIR_X = "https://x.com/intent/follow?screen_name=ActualidadNacAR"
+BLOQUE_SEGUIR_X = (
+    '<br><br><a href="' + LINK_SEGUIR_X + '" target="_blank" rel="noopener" '
+    'style="display:inline-block;background:#000;color:#fff;padding:8px 16px;'
+    'border-radius:20px;font-weight:bold;text-decoration:none;">'
+    'Seguí a Actualidad Nacional en X: @ActualidadNacAR</a>'
+)
+TEXTO_SEGUIR_X = "Seguí a Actualidad Nacional en X: @ActualidadNacAR"
+# Si el panel rechaza el HTML una vez, en el resto de la corrida se manda texto simple
+PANEL_ACEPTA_HTML = [True]
+
+
+def armar_cuerpo_html(texto):
+    """Separa la nota en párrafos (antes salía todo pegado) y agrega el botón de X al final."""
+    parrafos = [p.strip() for p in re.split(r"\n+", texto or "") if p.strip()]
+    return "<br><br>".join(parrafos) + BLOQUE_SEGUIR_X
+
+
+def armar_cuerpo_simple(texto):
+    """Versión de respaldo sin HTML: el texto tal cual, más la línea de X."""
+    return (texto or "").strip() + "\n\n" + TEXTO_SEGUIR_X
+
+
+def _enviar_nota(session, nota, ruta_imagen, orden, cuerpo):
+    r = session.get(PANEL_FORM_URL, timeout=15)
+    soup = BeautifulSoup(r.text, "lxml")
+    vs = soup.find("input", {"id": "__VIEWSTATE"})["value"]
+    vsg = soup.find("input", {"id": "__VIEWSTATEGENERATOR"})["value"]
+    ev = soup.find("input", {"id": "__EVENTVALIDATION"})["value"]
+    hoy = datetime.now()
+    data = {
+        "__VIEWSTATE": vs, "__VIEWSTATEGENERATOR": vsg, "__EVENTVALIDATION": ev,
+        "radio": str(orden),
+        "drpDay": hoy.strftime("%d"), "drpMonth": hoy.strftime("%m"), "drpYear": str(hoy.year),
+        "txtTitle": nota["titulo"], "txtSubTitle": nota["bajada"],
+        "txtDescriptionLong": cuerpo,
+        "imgPublicar.x": "98", "imgPublicar.y": "22",
+    }
+    files = None
+    if ruta_imagen and os.path.exists(ruta_imagen):
+        files = {"flUpload": (os.path.basename(ruta_imagen), open(ruta_imagen, "rb"), "image/jpeg")}
+    try:
+        r2 = session.post(PANEL_FORM_URL, data=data, files=files, timeout=30)
+    finally:
+        if files: files["flUpload"][1].close()
+    rechazo = ("potentially dangerous" in r2.text.lower()
+               or "potencialmente peligroso" in r2.text.lower())
+    return r2.status_code == 200 and not rechazo
+
+
+def publicar_nota(session, nota, ruta_imagen, orden):
+    if PANEL_ACEPTA_HTML[0]:
+        if _enviar_nota(session, nota, ruta_imagen, orden, armar_cuerpo_html(nota["texto"])):
+            return True
+        # El panel no aceptó el HTML: se reintenta con texto simple y no se vuelve a probar HTML
+        print("  ⚠️ El panel rechazó el formato con párrafos/botón de X. Reintento con texto simple...")
+        PANEL_ACEPTA_HTML[0] = False
+    return _enviar_nota(session, nota, ruta_imagen, orden, armar_cuerpo_simple(nota["texto"]))
+
+
+def procesar_nota(nota, session, orden, max_titulo, max_bajada, idx):
+    if not nota or not nota["titulo_original"]:
+        print("  ⚠️ Sin nota. Saltando...")
+        return False
+    print(f"  ✅ Extraída: {nota['titulo_original'][:60]}")
+    if es_nota_cotizacion_dolar(nota["titulo_original"], nota.get("bajada_original", "")):
+        print("  ⏭️ Nota de cotización del dólar: no se publica (ese tema está en /dolar-hoy.aspx).")
+        return False
+    try:
+        nota = reescribir_con_ia(nota, max_titulo=max_titulo, max_bajada=max_bajada)
+        print(f"  ✅ Reescrita: {nota['titulo']}")
+    except Exception as e:
+        # Nunca publicar el original cortado ni copiado: si la IA falla, la nota se saltea
+        print(f"  ⚠️ Error IA: {e}. Nota NO publicada (no se publica el original cortado).")
+        return False
+    ruta_img = descargar_imagen(nota.get("img_url"), f"nota_{idx}_{int(time.time())}")
+    print("  ✅ Imagen OK" if ruta_img else "  ⚠️ Sin imagen.")
+    if publicar_nota(session, nota, ruta_img, orden):
+        print(f"  ✅ Publicada en orden {orden}!")
+        registrar_publicada(nota.get("url"))
+        seccion = "politica" if str(idx).startswith("pol") else "otra"
+        NOTAS_PUBLICADAS_AHORA.append((nota["titulo"], nota["bajada"], seccion))
+        return True
+    else:
+        print("  ❌ Error al publicar.")
+        return False
+
+
+# ── Aviso por WhatsApp con posts listos para X (gratis) ─────────────────────
+# Despues de publicar, le manda a Jorge por WhatsApp (CallMeBot) links que abren X
+# con el post ya escrito (titulo + link a la nota): solo tiene que tocar "Postear".
+# Necesita los secretos CALLMEBOT_APIKEY y CALLMEBOT_PHONE. Si faltan, no hace nada.
+# Nunca puede frenar ni romper la publicacion de notas.
+import html as _html
+import unicodedata as _ud
+from datetime import timedelta as _td
+
+CALLMEBOT_APIKEY = os.environ.get("CALLMEBOT_APIKEY", "").strip()
+CALLMEBOT_PHONE = os.environ.get("CALLMEBOT_PHONE", "").strip()
+# APAGADO (2/11/2026): X ya postea solo desde jro-ar/automatizador-noticias (postear_x_actualidad.py).
+# Para volver a prenderlo: HORAS_AVISO_X = set(range(9, 23))
+HORAS_AVISO_X = set()
+MAX_POSTS_POR_AVISO = 2
+NOTAS_PUBLICADAS_AHORA = []           # (titulo, bajada, seccion) de esta corrida
+
+
+def _normalizar(t):
+    t = _ud.normalize("NFKD", _html.unescape(t or "")).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z0-9]+", " ", t.lower()).strip()
+
+
+def _urls_por_titulo():
+    """Lee el sitemap del sitio y arma {titulo normalizado: url de la nota}."""
+    r = requests.get("https://actualidadnacional.net/sitemap.aspx", headers=HEADERS, timeout=20)
+    mapa = {}
+    for bloque_url in re.findall(r"<url>(.*?)</url>", r.text, re.S):
+        loc = re.search(r"<loc>(.*?)</loc>", bloque_url)
+        tit = re.search(r"<news:title>(.*?)</news:title>", bloque_url, re.S)
+        if loc and tit:
+            mapa.setdefault(_normalizar(tit.group(1)), loc.group(1).strip())
+    return mapa
+
+
+def _link_para_x(url):
+    # Link sin caracteres especiales para que WhatsApp no lo rompa; X arma la tarjeta
+    # con el titulo y la foto de la nota.
+    return "https://x.com/intent/post?url=" + url
+
+
+def avisar_posts_para_x():
+    try:
+        if not CALLMEBOT_APIKEY or not CALLMEBOT_PHONE:
+            print("ℹ️ Aviso para X: faltan los secretos de CallMeBot, no se manda.")
+            return
+        hora_ar = (datetime.utcnow() - _td(hours=3)).hour
+        if hora_ar not in HORAS_AVISO_X:
+            print(f"ℹ️ Aviso para X: no se manda a esta hora ({hora_ar} h).")
+            return
+        if not NOTAS_PUBLICADAS_AHORA:
+            print("ℹ️ Aviso para X: no hubo notas nuevas.")
+            return
+        time.sleep(20)  # le da tiempo al sitio a sumar las notas al sitemap
+        mapa = _urls_por_titulo()
+        # primero politica, despues el resto, en el orden en que se publicaron
+        orden = sorted(NOTAS_PUBLICADAS_AHORA, key=lambda n: 0 if n[2] == "politica" else 1)
+        elegidas = []
+        for titulo, bajada, seccion in orden:
+            url = mapa.get(_normalizar(titulo))
+            if url and re.fullmatch(r"https://actualidadnacional\.net/[A-Za-z0-9~_.\-]+", url):
+                elegidas.append((titulo, url))
+            if len(elegidas) >= MAX_POSTS_POR_AVISO:
+                break
+        if not elegidas:
+            print("⚠️ Aviso para X: no encontré los links de las notas nuevas en el sitemap.")
+            return
+        partes = ["Actualidad Nacional - posts para X. Toca cada link y despues Postear:"]
+        for i, (titulo, url) in enumerate(elegidas, 1):
+            partes.append(f"{i}) {titulo}: {_link_para_x(url)} ")
+        texto = " \n".join(partes).strip()
+        r = requests.get("https://api.callmebot.com/whatsapp.php",
+                         params={"phone": CALLMEBOT_PHONE, "text": texto, "apikey": CALLMEBOT_APIKEY},
+                         timeout=30)
+        if "queued" in r.text.lower():
+            print(f"✅ Aviso para X enviado por WhatsApp ({len(elegidas)} posts).")
+        else:
+            print(f"⚠️ Aviso para X: CallMeBot respondió {r.status_code}.")
+    except Exception as e:
+        print(f"⚠️ Aviso para X no enviado: {e}")
+
+
+def ejecutar_automatizacion():
+    print("=" * 55)
+    print("🗞️ AUTOMATIZADOR — ActualidadNacional")
+    print(f"  Fecha: {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+    print("=" * 55)
+
+    session = hacer_login()
+    publicadas = 0
+
+    print("\n📌 SECCIÓN POLÍTICA")
+    urls = obtener_noticias_infobae(6)
+    for i, url in enumerate(urls, 1):
+        print(f"\n── Noticia política {i}/6")
+        nota = extraer_nota_infobae(url)
+        if procesar_nota(nota, session, orden=1, max_titulo=63, max_bajada=170, idx=f"pol_{i}"):
+            publicadas += 1
+        time.sleep(3)
+
+    # Si Infobae no tuvo suficientes notas nuevas de política, completar con TN Política
+    try:
+        publicadas += completar_politica(session, publicadas)
+    except Exception as e:
+        print(f"  ⚠️ Respaldo de política falló: {e}")
+
+    print("\n📌 SECCIÓN ECONOMÍA")
+    nota_eco = obtener_nota_tn()
+    if procesar_nota(nota_eco, session, orden=4, max_titulo=45, max_bajada=84, idx="eco"):
+        publicadas += 1
+    time.sleep(3)
+
+    print("\n📌 SECCIÓN DEPORTES")
+    nota_dep = obtener_nota_deportes_infobae()
+    if procesar_nota(nota_dep, session, orden=5, max_titulo=45, max_bajada=84, idx="dep"):
+        publicadas += 1
+
+    print(f"\n{'='*55}")
+    print(f"🎉 TERMINADO: {publicadas} noticias publicadas")
+    print("=" * 55)
+
+    avisar_posts_para_x()
+
+
+if __name__ == "__main__":
+    ejecutar_automatizacion()
