@@ -1,0 +1,15 @@
+name: Prueba lectura ANSES (no publica)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Leer calendario oficial de ANSES
+        run: |
+          curl -sS -o a.html -w 'HTTP %{http_code}\n' -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36' https://www.anses.gob.ar/consultas/calendario-de-pagos || true
+          wc -c a.html || true
+          grep -o 'Mes a cobrar' a.html | wc -l || true
