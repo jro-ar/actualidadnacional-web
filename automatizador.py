@@ -434,7 +434,7 @@ def combinar_fuentes(nota, otra):
             "urls_extra": [otra["url"]]}
 
 
-def obtener_nota_deportes_infobae():
+def obtener_nota_deportes_infobae(excluir=()):
     print("📰 Scrapeando Infobae Deportes...")
     r = requests.get("https://www.infobae.com/deportes/", headers=HEADERS, timeout=15)
     soup = BeautifulSoup(r.text, "lxml")
@@ -444,7 +444,7 @@ def obtener_nota_deportes_infobae():
         if not href.startswith("http"):
             href = "https://www.infobae.com" + href
         if "/deportes/" not in href: continue
-        if href in vistos or href in URLS_PUBLICADAS or len(href) < 40: continue
+        if href in vistos or href in URLS_PUBLICADAS or href in excluir or len(href) < 40: continue
         if any(x in href for x in ["#", "autor", "tag", "categoria"]): continue
         vistos.add(href)
         try:
@@ -1137,6 +1137,9 @@ def avisar_posts_para_x():
         print(f"⚠️ Aviso para X no enviado: {e}")
 
 
+DEPORTES_POR_CORRIDA = 2
+
+
 def ejecutar_automatizacion():
     print("=" * 55)
     print("🗞️ AUTOMATIZADOR — ActualidadNacional")
@@ -1168,9 +1171,21 @@ def ejecutar_automatizacion():
     time.sleep(3)
 
     print("\n📌 SECCIÓN DEPORTES")
-    nota_dep = obtener_nota_deportes_infobae()
-    if procesar_nota(nota_dep, session, orden=5, max_titulo=45, max_bajada=84, idx="dep"):
-        publicadas += 1
+    # 2 notas de deportes por corrida (25/11/2026): en Google, deportes trae más impresiones
+    # y clics por nota que política. Si la primera falla, la segunda no la repite.
+    vistas_dep = set()
+    for n_dep in range(1, DEPORTES_POR_CORRIDA + 1):
+        try:
+            nota_dep = obtener_nota_deportes_infobae(excluir=vistas_dep)
+        except Exception as e:
+            print(f"  ⚠️ Deportes {n_dep}: no se pudo leer Infobae Deportes ({e})")
+            break
+        if not nota_dep:
+            break
+        vistas_dep.add(nota_dep.get("url"))
+        if procesar_nota(nota_dep, session, orden=5, max_titulo=45, max_bajada=84, idx=f"dep{n_dep}"):
+            publicadas += 1
+        time.sleep(3)
 
     print(f"\n{'='*55}")
     print(f"🎉 TERMINADO: {publicadas} noticias publicadas")
