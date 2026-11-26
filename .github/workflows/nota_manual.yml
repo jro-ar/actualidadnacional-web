@@ -1,0 +1,67 @@
+name: Nota manual (tema del dia)
+
+on:
+  workflow_dispatch:
+    inputs:
+      publicar:
+        description: "si = publica en la web; no = solo prueba"
+        required: true
+        default: "no"
+        type: choice
+        options: ["no", "si"]
+
+jobs:
+  nota:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r requirements.txt
+      - name: Armar (y si se pide, publicar) la nota
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ACTUALIDAD_PANEL_USER: ${{ secrets.ACTUALIDAD_PANEL_USER }}
+          ACTUALIDAD_PANEL_PASS: ${{ secrets.ACTUALIDAD_PANEL_PASS }}
+          PUBLICAR: ${{ inputs.publicar }}
+        run: |
+          cat > /tmp/m.py <<'PY'
+          import sys, os, time
+          sys.path.insert(0, ".")
+          import automatizador as a
+          FUENTES = [
+              "https://forbes.es/ultima-hora/1074209/nvidia-suspende-los-envios-de-chips-al-sudeste-asiatico-segun-ft/",
+              "https://www.uhnplus.com/nvidia-frena-envio-servidores-chips-ia-sudeste-asiatico/",
+          ]
+          notas = []
+          for u in FUENTES:
+              n = a.extraer_nota_infobae(u)
+              if n and n["titulo_original"] and len(n["cuerpo_original"]) > 400:
+                  print("FUENTE OK:", n["titulo_original"], "| bajada:", n["bajada_original"][:120], "| chars:", len(n["cuerpo_original"]), "| img:", n["img_url"])
+                  notas.append(n)
+              else:
+                  print("FUENTE SIN TEXTO:", u)
+          if not notas:
+              raise SystemExit("Ninguna fuente se pudo leer")
+          nota = a.combinar_fuentes(notas[0], notas[1]) if len(notas) > 1 else notas[0]
+          if not nota.get("img_url"):
+              nota["img_url"] = next((n["img_url"] for n in notas if n.get("img_url")), None)
+          r = a.reescribir_con_ia(nota, max_titulo=45, max_bajada=84)
+          print("\n######## TITULO (%d): %s" % (len(r["titulo"]), r["titulo"]))
+          print("BAJADA (%d): %s" % (len(r["bajada"]), r["bajada"]))
+          print("TEXTO:\n" + r["texto"])
+          print("######## FIN")
+          if os.environ.get("PUBLICAR") != "si":
+              print("PRUEBA OK (no se publico nada)")
+              sys.exit(0)
+          session = a.hacer_login()
+          ruta = a.descargar_imagen(r.get("img_url"), "nota_manual_%d" % int(time.time()))
+          print("Imagen OK" if ruta else "Sin imagen")
+          if a.publicar_nota(session, r, ruta, 4):
+              print("PUBLICADA OK")
+          else:
+              raise SystemExit("No se pudo publicar")
+          PY
+          python /tmp/m.py
