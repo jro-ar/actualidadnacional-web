@@ -20,39 +20,24 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install -r requirements.txt
-      - name: Armar (y si se pide, publicar) la nota
+      - name: Publicar la nota revisada (texto fijo, verificado a mano)
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           ACTUALIDAD_PANEL_USER: ${{ secrets.ACTUALIDAD_PANEL_USER }}
           ACTUALIDAD_PANEL_PASS: ${{ secrets.ACTUALIDAD_PANEL_PASS }}
           PUBLICAR: ${{ inputs.publicar }}
         run: |
+          cat > /tmp/nota.json <<'JS'
+          {"titulo": "Nvidia frena chips de IA al sudeste asi\u00e1tico", "bajada": "Dell y Supermicro frenaron pedidos en Malasia, Singapur, Tailandia e Indonesia.", "img_url": "https://forbes.es/wp-content/uploads/2026/11/fotonoticia_20261126122541_1920-1200x675.jpg", "texto": "Nvidia orden\u00f3 a sus socios fabricantes detener el env\u00edo de servidores con chips de inteligencia artificial hacia Malasia, Singapur, Tailandia e Indonesia. La decisi\u00f3n fue comunicada a los compradores de esos mercados por ensambladores como Dell y Supermicro, que integran los procesadores de Nvidia en sus equipos y notificaron a sus clientes que la empresa estadounidense no autorizar\u00e1 la salida de los pedidos pendientes.\n\nLa medida se produce tras la publicaci\u00f3n, el 19 de noviembre, de una norma provisional del Departamento de Comercio de Estados Unidos que exige licencias espec\u00edficas para exportar semiconductores avanzados a Indonesia, Malasia, Singapur, Tailandia y Brasil, pa\u00edses clasificados con un \"riesgo de desv\u00edo m\u00e1s alto de lo normal\". La regulaci\u00f3n tambi\u00e9n alcanza a los centros de datos extranjeros que alquilan grandes vol\u00famenes de capacidad de c\u00f3mputo a empresas de China o Macao, oblig\u00e1ndolos a auditar la propiedad directa o indirecta de sus clientes.\n\nTodav\u00eda no est\u00e1 claro si la suspensi\u00f3n ser\u00e1 temporal. Nvidia y sus socios comerciales eval\u00faan de qu\u00e9 manera cumplir con las nuevas exigencias de Washington. Seg\u00fan el Centro de Estudios Estrat\u00e9gicos e Internacionales, las solicitudes de licencia se analizar\u00e1n caso por caso y no aplicar\u00e1n a filiales de empresas con sede en Estados Unidos que cumplan ciertos requisitos de reporte.\n\nEl objetivo de la norma es cerrar una v\u00eda ampliamente usada por desarrolladores chinos de inteligencia artificial: como no pueden comprar chips de Nvidia directamente, recurren al alquiler remoto de servidores instalados en terceros pa\u00edses. Los cuatro mercados del sudeste asi\u00e1tico afectados se hab\u00edan convertido en destinos clave para ese esquema, y la demanda de empresas tecnol\u00f3gicas chinas impuls\u00f3 una ola de inversiones en centros de datos en la regi\u00f3n, especialmente en Malasia e Indonesia, donde se volcaron miles de millones de d\u00f3lares en infraestructura.\n\nLa entrada en vigor de la normativa ya genera incertidumbre operativa en el sector. Ejecutivos del rubro advierten que hay una norma nueva, pero sin una gu\u00eda clara para aplicarla dentro del plazo de 90 d\u00edas. En ese contexto, la firma singapurense Aolani enfrenta el posible colapso de un contrato de c\u00f3mputo con ByteDance, matriz de TikTok, despu\u00e9s de que sus prestamistas retuvieran unos 500 millones de d\u00f3lares en cr\u00e9ditos.\n\nLa ofensiva regulatoria tambi\u00e9n coincide con el escrutinio sobre Megaspeed, empresa de nube con sede en Singapur y socia de Nvidia que est\u00e1 siendo investigada por presunto desv\u00edo de chips avanzados hacia China.\n\nLa regi\u00f3n tiene un peso significativo en las finanzas de Nvidia: la compa\u00f1\u00eda registr\u00f3 ingresos por 104.000 millones de d\u00f3lares a trav\u00e9s de su filial en Singapur en 2025, un aumento anual del 72%. Desde esa unidad tambi\u00e9n se contabilizan parte de los ingresos provenientes de Taiw\u00e1n y China.\n\nContexto: Los controles de exportaci\u00f3n son restricciones que impone un pa\u00eds sobre bienes estrat\u00e9gicos que salen de su territorio. Estados Unidos aplica estos mecanismos sobre semiconductores avanzados para limitar el acceso de potencias rivales a tecnolog\u00edas clave para el desarrollo de inteligencia artificial y aplicaciones militares."}
+          JS
           cat > /tmp/m.py <<'PY'
-          import sys, os, time
+          import sys, os, time, json
           sys.path.insert(0, ".")
           import automatizador as a
-          FUENTES = [
-              "https://forbes.es/ultima-hora/1074209/nvidia-suspende-los-envios-de-chips-al-sudeste-asiatico-segun-ft/",
-              "https://www.uhnplus.com/nvidia-frena-envio-servidores-chips-ia-sudeste-asiatico/",
-          ]
-          notas = []
-          for u in FUENTES:
-              n = a.extraer_nota_infobae(u)
-              if n and n["titulo_original"] and len(n["cuerpo_original"]) > 400:
-                  print("FUENTE OK:", n["titulo_original"], "| bajada:", n["bajada_original"][:120], "| chars:", len(n["cuerpo_original"]), "| img:", n["img_url"])
-                  notas.append(n)
-              else:
-                  print("FUENTE SIN TEXTO:", u)
-          if not notas:
-              raise SystemExit("Ninguna fuente se pudo leer")
-          nota = a.combinar_fuentes(notas[0], notas[1]) if len(notas) > 1 else notas[0]
-          if not nota.get("img_url"):
-              nota["img_url"] = next((n["img_url"] for n in notas if n.get("img_url")), None)
-          r = a.reescribir_con_ia(nota, max_titulo=45, max_bajada=84)
-          print("\n######## TITULO (%d): %s" % (len(r["titulo"]), r["titulo"]))
+          r = json.load(open("/tmp/nota.json", encoding="utf-8"))
+          print("TITULO (%d): %s" % (len(r["titulo"]), r["titulo"]))
           print("BAJADA (%d): %s" % (len(r["bajada"]), r["bajada"]))
           print("TEXTO:\n" + r["texto"])
-          print("######## FIN")
           if os.environ.get("PUBLICAR") != "si":
               print("PRUEBA OK (no se publico nada)")
               sys.exit(0)
